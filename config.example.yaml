@@ -1,0 +1,20 @@
+# sub2api-scheduler configuration
+# Copy to config.yaml and fill in your values.
+
+server:
+  port: "8090"
+
+database:
+  # PostgreSQL DSN for the sub2api database
+  dsn: "postgres://sub2api:CHANGE_ME@postgres:5432/sub2api?sslmode=disable"
+
+sub2api:
+  # Internal sub2api API endpoint
+  base_url: "http://sub2api:8080"
+  # Admin API key (Server -> API Keys -> Admin API Key in the sub2api panel)
+  admin_api_key: "CHANGE_ME"
+
+redis:
+  # sub2api's Redis
+  addr: "redis:6379"
+  password: ""

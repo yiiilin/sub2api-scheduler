@@ -1,0 +1,16 @@
+# Binary
+account-switcher
+sub2api-scheduler
+
+# Config (never commit secrets)
+config.yaml
+config.local.yaml
+
+# Runtime
+data/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
