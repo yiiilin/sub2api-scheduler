@@ -73,6 +73,34 @@ cp config.example.yaml config.yaml
 
 打开看板：`http://127.0.0.1:8090`。
 
+### Docker / docker compose
+
+目前没有发布到镜像仓库的官方镜像，需要自己构建（产物是 Alpine 上的小型静态二进制）。
+
+```bash
+# 用 compose 构建并启动
+cp config.example.yaml config.yaml   # 先编辑 DSN 和 admin_api_key
+docker compose up -d --build
+
+# 或者只构建镜像
+docker build -t sub2api-scheduler:latest .
+```
+
+容器读取 `/app/config.yaml`（可用 `CONFIG_PATH` 环境变量覆盖），监听 8090 端口。
+按 `docker-compose.yml` 中的示例把真实的 `config.yaml` 挂载进容器。
+
+调度器与 Sub2API 共用同一个 PostgreSQL 数据库，因此容器必须能访问 Sub2API 的
+PostgreSQL（`config.yaml` 里的 DSN）和它的管理 API（`sub2api.base_url`）。
+如果 Sub2API 也跑在 Docker 里，把本容器放到同一个 Docker 网络（见
+`docker-compose.yml` 中被注释的 `networks` 段），或在 DSN 中使用宿主机可访问的地址。
+
+查看日志：`docker compose logs -f scheduler`。
+
+### 容器健康检查
+
+`/api/health` 返回 `{"ok": true}`，compose 的 healthcheck 会使用它；
+配置或数据库无效时容器会立即退出，方便编排自动重启/告警。
+
 ---
 
 ## 数据库初始化

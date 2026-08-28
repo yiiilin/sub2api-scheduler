@@ -96,6 +96,37 @@ cp config.example.yaml config.yaml
 
 Open the dashboard at `http://127.0.0.1:8090`.
 
+### Docker / docker compose
+
+There is no published image; build it yourself (the result is a small static
+binary on Alpine).
+
+```bash
+# build and run with compose
+cp config.example.yaml config.yaml   # edit DSN + admin_api_key first
+docker compose up -d --build
+
+# or build the image only
+docker build -t sub2api-scheduler:latest .
+```
+
+The container reads `/app/config.yaml` (override with the `CONFIG_PATH`
+environment variable) and listens on port 8090. Mount your real `config.yaml`
+as shown in `docker-compose.yml`.
+
+The scheduler shares Sub2API's PostgreSQL database, so the container must be
+able to reach both Sub2API's Postgres (the DSN in `config.yaml`) and its admin
+API (`sub2api.base_url`). When Sub2API runs in Docker, put this container on
+the same Docker network (see the commented `networks` section in
+`docker-compose.yml`) or use a host-accessible Postgres address in the DSN.
+
+Logs: `docker compose logs -f scheduler`.
+
+### Container health
+
+`/api/health` returns `{"ok": true}` and is used by the compose healthcheck;
+the container also exits immediately if the config or database is invalid.
+
 ---
 
 ## Database setup

@@ -1,0 +1,32 @@
+services:
+  scheduler:
+    build: .
+    image: sub2api-scheduler:latest
+    container_name: sub2api-scheduler
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8090:8090"
+    environment:
+      # Path to the config file inside the container (see config volume below)
+      CONFIG_PATH: /app/config.yaml
+      TZ: Asia/Shanghai
+    volumes:
+      # Mount your real config; secrets live only on the host.
+      - ./config.yaml:/app/config.yaml:ro
+    # The scheduler shares the Sub2API PostgreSQL database, so it must run on
+    # the same Docker network as Sub2API, or reach its Postgres/API another way.
+    # Uncomment and adjust when deploying next to Sub2API:
+    # networks:
+    #   - sub2api_default
+    # dns:
+    #   - 127.0.0.1
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8090/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+# networks:
+#   sub2api_default:
+#     external: true
