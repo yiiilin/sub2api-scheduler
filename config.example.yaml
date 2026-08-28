@@ -2,19 +2,16 @@
 # Copy to config.yaml and fill in your values.
 
 server:
+  # Bind address. 127.0.0.1 = localhost only; set to 0.0.0.0 to expose on all interfaces.
+  host: "127.0.0.1"
   port: "8090"
 
 database:
-  # PostgreSQL DSN for the sub2api database
+  # PostgreSQL DSN for the sub2api database (required)
   dsn: "postgres://sub2api:CHANGE_ME@postgres:5432/sub2api?sslmode=disable"
 
 sub2api:
   # Internal sub2api API endpoint
   base_url: "http://sub2api:8080"
-  # Admin API key (Server -> API Keys -> Admin API Key in the sub2api panel)
+  # Admin API key (Server -> API Keys -> Admin API Key in the sub2api panel) (required)
   admin_api_key: "CHANGE_ME"
-
-redis:
-  # sub2api's Redis
-  addr: "redis:6379"
-  password: ""

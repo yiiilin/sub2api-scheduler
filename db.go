@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
@@ -10,44 +11,54 @@ import (
 
 // Account 账号（只读安全字段，绝不包含 credentials）
 type Account struct {
-	ID                   int64   `json:"id"`
-	Name                 string  `json:"name"`
-	Platform             string  `json:"platform"`
-	Priority             int     `json:"priority"`
-	Schedulable          bool    `json:"schedulable"`
-	Status               string  `json:"status"`
-	TempUnschedulable    *string `json:"temp_unschedulable_until,omitempty"`
-	RateLimited          *string `json:"rate_limit_reset_at,omitempty"`
-	OverloadUntil        *string `json:"overload_until,omitempty"`
-	ErrorMsg             *string `json:"error_message,omitempty"`
-	Notes                *string `json:"notes,omitempty"`
-	RateMultiplier       *float64 `json:"rate_multiplier"`
-	LoadFactor           *float64 `json:"load_factor"`
+	ID                int64    `json:"id"`
+	Name              string   `json:"name"`
+	Platform          string   `json:"platform"`
+	Priority          int      `json:"priority"`
+	Schedulable       bool     `json:"schedulable"`
+	Status            string   `json:"status"`
+	TempUnschedulable *string  `json:"temp_unschedulable_until,omitempty"`
+	RateLimited       *string  `json:"rate_limit_reset_at,omitempty"`
+	OverloadUntil     *string  `json:"overload_until,omitempty"`
+	ErrorMsg          *string  `json:"error_message,omitempty"`
+	Notes             *string  `json:"notes,omitempty"`
+	RateMultiplier    *float64 `json:"rate_multiplier"`
+	LoadFactor        *float64 `json:"load_factor"`
 }
 
 // SwitchHistory 切换历史记录（本地表）
 type SwitchHistory struct {
-	ID          int64      `json:"id"`
-	RuleName    string     `json:"rule_name"`
-	Action      string     `json:"action"`
-	AccountID   int64      `json:"account_id"`
-	AccountName string     `json:"account_name"`
-	OldPriority int        `json:"old_priority"`
-	NewPriority int        `json:"new_priority"`
-	SchedFrom   *bool      `json:"sched_from"` // 调度状态变化（新语义）
-	SchedTo     *bool      `json:"sched_to"`
-	TriggeredBy string     `json:"triggered_by"` // cron / manual / failover
-	Status      string     `json:"status"`       // success / error
-	Message     string     `json:"message"`
-	CreatedAt   time.Time  `json:"created_at"`
+	ID          int64     `json:"id"`
+	RuleName    string    `json:"rule_name"`
+	Action      string    `json:"action"`
+	AccountID   int64     `json:"account_id"`
+	AccountName string    `json:"account_name"`
+	OldPriority int       `json:"old_priority"`
+	NewPriority int       `json:"new_priority"`
+	SchedFrom   *bool     `json:"sched_from"` // 调度状态变化（新语义）
+	SchedTo     *bool     `json:"sched_to"`
+	TriggeredBy string    `json:"triggered_by"` // cron / manual / failover
+	Status      string    `json:"status"`       // success / error
+	Message     string    `json:"message"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
+const schedulerAdvisoryLockName = "sub2api-scheduler:lane-monitor"
+
 type DB struct {
-	pool *pgxpool.Pool
+	pool     *pgxpool.Pool
+	lockConn *pgxpool.Conn
 }
 
 func NewDB(ctx context.Context, dsn string) (*DB, error) {
-	pool, err := pgxpool.New(ctx, dsn)
+	poolConfig, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	if poolConfig.MaxConns < 2 {
+		poolConfig.MaxConns = 2
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -55,16 +66,47 @@ func NewDB(ctx context.Context, dsn string) (*DB, error) {
 		pool.Close()
 		return nil, err
 	}
-	db := &DB{pool: pool}
-	if err := db.initSchema(ctx); err != nil {
+	lockConn, err := pool.Acquire(ctx)
+	if err != nil {
 		pool.Close()
+		return nil, fmt.Errorf("acquire scheduler lock connection: %w", err)
+	}
+	var acquired bool
+	if err := lockConn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtext($1))`, schedulerAdvisoryLockName).Scan(&acquired); err != nil {
+		lockConn.Release()
+		pool.Close()
+		return nil, fmt.Errorf("acquire scheduler advisory lock: %w", err)
+	}
+	if !acquired {
+		lockConn.Release()
+		pool.Close()
+		return nil, fmt.Errorf("another scheduler instance already uses database")
+	}
+
+	db := &DB{pool: pool, lockConn: lockConn}
+	if err := db.initSchema(ctx); err != nil {
+		db.Close()
 		return nil, err
 	}
-	log.Printf("[db] connected & schema ready")
+	log.Printf("[db] connected, scheduler lock acquired, schema ready")
 	return db, nil
 }
 
-func (d *DB) Close() { d.pool.Close() }
+func (d *DB) Close() {
+	if d == nil {
+		return
+	}
+	if d.lockConn != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, _ = d.lockConn.Exec(ctx, `SELECT pg_advisory_unlock(hashtext($1))`, schedulerAdvisoryLockName)
+		cancel()
+		d.lockConn.Release()
+		d.lockConn = nil
+	}
+	if d.pool != nil {
+		d.pool.Close()
+	}
+}
 
 // initSchema 建本地历史表+规则表（不影响 sub2api 自身表）
 func (d *DB) initSchema(ctx context.Context) error {
@@ -94,6 +136,17 @@ ALTER TABLE switch_history ADD COLUMN IF NOT EXISTS sched_to BOOLEAN;`); err != 
 	}
 	if err := d.ensureLaneBoardSchema(ctx); err != nil {
 		return err
+	}
+	return d.ensureSchedulerOutbox(ctx)
+}
+
+func (d *DB) ensureSchedulerOutbox(ctx context.Context) error {
+	var exists bool
+	if err := d.pool.QueryRow(ctx, `SELECT to_regclass('scheduler_outbox') IS NOT NULL`).Scan(&exists); err != nil {
+		return fmt.Errorf("check Sub2API scheduler_outbox: %w", err)
+	}
+	if !exists {
+		return fmt.Errorf("Sub2API scheduler_outbox table is missing; apply the Sub2API scheduler migration first")
 	}
 	return nil
 }

@@ -163,14 +163,23 @@ label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
 
 <script>
 const token = new URLSearchParams(location.search).get('token') || '';
+if (token) {
+  const cleanUrl = new URL(location.href);
+  cleanUrl.searchParams.delete('token');
+  history.replaceState(null, '', cleanUrl.pathname + cleanUrl.search + cleanUrl.hash);
+}
 function apiUrl(p) {
   const base = location.pathname.replace(/\/+$/, '') + '/api';
-  return base + p + (token ? (p.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token) : '');
+  return base + p;
 }
-async function j(p, opts) {
-  const r = await fetch(apiUrl(p), opts);
+async function j(p, opts = {}) {
+  const headers = { ...(opts.headers || {}) };
+  if (token) headers.Authorization = 'Bearer ' + token;
+  const r = await fetch(apiUrl(p), { ...opts, headers });
+  const body = await r.json().catch(() => ({}));
   if (r.status === 401) { toast('未授权：token 无效或已过期'); throw new Error('unauthorized'); }
-  return r.json();
+  if (!r.ok) throw new Error(body.error || body.message || r.statusText || ('HTTP ' + r.status));
+  return body;
 }
 function toast(msg) { const t=document.getElementById('toast'); t.textContent=msg; t.style.display='block'; setTimeout(()=>t.style.display='none',3000); }
 function badge(cls, txt) { return `<span class="badge ${cls}">${txt}</span>`; }
@@ -268,10 +277,14 @@ function accCard(a, b) {
 }
 
 async function probeAccount(boardId, accountId) {
-  const d = await j(`/boards/${boardId}/probe/${accountId}`, { method:'POST' });
-  if (d.healthy) toast('✅ 探测成功，已恢复调度');
-  else toast('⚠️ ' + (d.message || '探测失败'));
-  loadBoards();
+  try {
+    const d = await j(`/boards/${boardId}/probe/${accountId}`, { method:'POST' });
+    if (d.healthy) toast('✅ 探测成功，已恢复调度');
+    else toast('⚠️ ' + (d.message || '探测失败'));
+    await loadBoards();
+  } catch (e) {
+    toast('探测失败: ' + e.message);
+  }
 }
 
 let histPageNum = 1;
@@ -333,19 +346,15 @@ let lanes = [];
 
 function loadCandidates() {
   const model = document.getElementById('bf_model').value.trim();
-  const sel = document.getElementById('candSel');
-  if (!model) { candidates = []; if (sel) sel.innerHTML = '<span style="color:var(--muted)">先填模型名</span>'; return; }
+  if (!model) { candidates = []; renderLaneEditor(); return; }
   j('/board-candidates?model=' + encodeURIComponent(model)).then(d => {
     candidates = d.accounts || [];
-    if (sel) sel.innerHTML = candidates.map(a =>
-      `<label class="acc-chip ${isInAnyLane(a.id)?'checked':''}" onclick="toggleCand(${a.id},this)">
-        <input type="checkbox" ${isInAnyLane(a.id)?'checked':''} onchange="event.stopPropagation()">${esc(a.name)} <span class="mono">#${a.id}</span> ${badge('muted','p'+a.priority)}
-      </label>`).join('') || '<span style="color:var(--muted)">没有账号映射该模型</span>';
-  }).catch(() => { if (sel) sel.innerHTML = '<span style="color:var(--err)">加载失败</span>'; });
+    renderLaneEditor(); // 候选到达后重渲染泳道勾选（修复异步竞态）
+  }).catch(() => {
+    candidates = [];
+    renderLaneEditor();
+  });
 }
-
-function isInAnyLane(id) { return lanes.some(l => l.account_ids.has(id)); }
-function toggleCand(id, el) {}
 
 function renderLaneEditor() {
   const box = document.getElementById('laneEditor');
@@ -403,11 +412,10 @@ function openBoardModal(id) {
       document.getElementById('bf_threshold').value = b.fail_threshold;
       document.getElementById('bf_window').value = b.window_seconds;
       document.getElementById('bf_probe').value = b.probe_interval;
+      // 先铺好已有泳道，再异步加载候选；候选到达后 renderLaneEditor 会重渲染
+      lanes = b.lanes.map(l => ({ name: l.name, account_ids: new Set(l.account_ids) }));
+      renderLaneEditor();
       loadCandidates();
-      setTimeout(() => {
-        lanes = b.lanes.map(l => ({ name: l.name, account_ids: new Set(l.account_ids) }));
-        renderLaneEditor();
-      }, 300);
     }
   } else {
     renderLaneEditor();
@@ -442,13 +450,17 @@ async function saveBoard() {
 
 async function deleteBoard(id) {
   if (!confirm('确认删除该泳道图？删除会恢复所有被它禁用的模型调度。')) return;
-  await j('/boards/'+id, { method:'DELETE' });
-  toast('已删除');
-  loadBoards();
+  try {
+    await j('/boards/'+id, { method:'DELETE' });
+    toast('已删除');
+    await loadBoards();
+  } catch (e) {
+    toast('删除失败: ' + e.message);
+  }
 }
 
-loadAll();
-setInterval(loadAll, 30000);
+loadAll().catch(e => toast('加载失败: ' + e.message));
+setInterval(() => loadAll().catch(() => {}), 30000);
 </script>
 </body>
 </html>

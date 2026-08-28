@@ -35,8 +35,10 @@ automatically:
   traffic is still failing (no flapping).
 - **Rebuilds** the same ladder for multiple models side by side.
 
-Everything runs through Sub2API's own admin API — no direct database writes, no
-stale scheduler cache, no 503s after a lane switch.
+Model-limit mutations use the shared PostgreSQL transaction and
+`account_changed` outbox, while probes and account-level scheduling toggles use
+Sub2API's admin API. This keeps the account row and scheduler snapshot
+consistent without a GET/PUT lost-update window.
 
 ---
 
@@ -53,9 +55,9 @@ stale scheduler cache, no 503s after a lane switch.
 - **External-state awareness** — respects Sub2API's own schedulable flag,
   status, cooldowns, and model rate limits; re-opens a scheduler-closed account
   with debounce, never fighting the gateway.
-- **Scheduler-cache correct** — all control goes through Sub2API's admin API,
-  which invalidates its own Redis snapshot via the outbox — DB and scheduler
-  stay in sync.
+- **Scheduler-cache correct** — model-limit updates are atomic with the shared
+  PostgreSQL row and `account_changed` outbox; probes and account toggles use the
+  Sub2API admin API.
 - **Web dashboard** — one page per model showing lane state, failure counts,
   probe status, and a manual probe button.
 - **Self-hosted** — single static Go binary, listens on localhost, config via
@@ -67,11 +69,10 @@ stale scheduler cache, no 503s after a lane switch.
 
 ### Prerequisites
 
-- A running [Sub2API](https://github.com/Wei-Shaw/sub2api) instance with its
-  PostgreSQL and Redis.
+- A current Sub2API installation with the `scheduler_outbox` migration applied.
 - An admin API key for Sub2API (Server → API Keys → Admin API Key).
-- The `lane_*` tables in the Sub2API database (see
-  [Database setup](#database-setup)).
+- The PostgreSQL user in `database.dsn` must be allowed to read/update `accounts`,
+  create/alter the scheduler's `lane_*` tables, and insert `scheduler_outbox` rows.
 
 ### Build
 
@@ -83,7 +84,7 @@ go build -o sub2api-scheduler .
 
 ```bash
 cp config.example.yaml config.yaml
-# edit: database DSN, sub2api base_url + admin_api_key, redis addr
+# edit: database DSN and sub2api base_url + admin_api_key
 ```
 
 ### Run
@@ -99,57 +100,23 @@ Open the dashboard at `http://127.0.0.1:8090`.
 
 ## Database setup
 
-The scheduler reads/writes Sub2API's shared schema. Create the lane tables in
-the same PostgreSQL database as Sub2API (run once):
+No manual SQL is required. On startup the daemon creates and migrates its
+`lane_boards`, `lane_boards_lanes`, and `lane_account_states` tables in the
+Sub2API PostgreSQL database. It also upgrades tables created from older README
+versions by adding lane IDs, defaults, state rows, and uniqueness constraints.
 
-```sql
-CREATE TABLE IF NOT EXISTS lane_boards (
-    id              BIGSERIAL PRIMARY KEY,
-    name            TEXT NOT NULL,
-    model           TEXT NOT NULL,
-    enabled         BOOLEAN NOT NULL DEFAULT true,
-    fail_threshold  INT NOT NULL DEFAULT 3,
-    window_seconds  INT NOT NULL DEFAULT 60,
-    probe_interval  INT NOT NULL DEFAULT 30,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+Create and edit boards from the web dashboard. Each model may belong to only
+one board, and an account may appear only once in that board. An account must
+be able to serve the board's model under Sub2API's explicit mapping, platform
+default mapping, or pass-through rules.
 
-CREATE TABLE IF NOT EXISTS lane_boards_lanes (
-    board_id    BIGINT NOT NULL REFERENCES lane_boards(id) ON DELETE CASCADE,
-    position    INT NOT NULL,
-    name        TEXT NOT NULL,
-    account_ids BIGINT[] NOT NULL,
-    PRIMARY KEY (board_id, position)
-);
+Startup fails fast if existing data contains duplicate board names, duplicate board
+models, or duplicate account memberships within a board; resolve those
+duplicates before restarting. The migration also ignores NULL and non-positive
+elements in legacy account ID arrays.
 
-CREATE TABLE IF NOT EXISTS lane_account_states (
-    board_id       BIGINT NOT NULL REFERENCES lane_boards(id) ON DELETE CASCADE,
-    account_id     BIGINT NOT NULL,
-    state          TEXT NOT NULL DEFAULT 'healthy',  -- healthy | disabled | suppressed
-    fail_count     INT NOT NULL DEFAULT 0,
-    disabled_at    TIMESTAMPTZ,
-    checked_at     TIMESTAMPTZ,
-    last_probe_at  TIMESTAMPTZ,
-    last_probe_ok  BOOLEAN,
-    last_probe_msg TEXT,
-    PRIMARY KEY (board_id, account_id)
-);
-```
-
-Then insert your boards: each board owns one model and its lanes, e.g.
-
-```sql
-INSERT INTO lane_boards (name, model) VALUES ('my-flash', 'flash-v1');
-
-INSERT INTO lane_boards_lanes (board_id, position, name, account_ids) VALUES
-(1, 0, 'primary-proxy',   '{11}'),
-(1, 1, 'reseller',        '{22}'),
-(1, 2, 'official',        '{33}');
-```
-
-The scheduler picks lanes left to right; a lane is *active* when it has the
-first healthy account.
+Only one scheduler instance may use a database at a time; startup takes a PostgreSQL
+advisory lock and refuses a second instance.
 
 ---
 
@@ -172,7 +139,8 @@ first healthy account.
         │   suppress lower lanes       │
         │   release & verify higher    │
         └──────────┬───────────────────┘
-                   │ admin API (PUT/POST/DELETE)
+                   │ PostgreSQL row lock + account_changed outbox
+                   │ admin API (probe / schedulable)
                    ▼
         ┌──────────────────────────────┐
         │  Sub2API gateway             │
@@ -206,12 +174,15 @@ re-enabled to immediately trip the circuit again.
 
 | Key | Default | Description |
 | --- | --- | --- |
+| `server.host` | `127.0.0.1` | Bind address (set to `0.0.0.0` to expose on all interfaces) |
 | `server.port` | `8090` | Dashboard port |
-| `database.dsn` | — | Sub2API PostgreSQL DSN |
+| `database.dsn` | — | Sub2API PostgreSQL DSN (**required**) |
 | `sub2api.base_url` | `http://sub2api:8080` | Sub2API internal API |
-| `sub2api.admin_api_key` | — | Sub2API admin API key |
-| `redis.addr` | `redis:6379` | Sub2API Redis |
-| `redis.password` | — | Redis password |
+| `sub2api.admin_api_key` | — | Sub2API admin API key (**required**) |
+
+`database.dsn` and `sub2api.admin_api_key` are required: the daemon refuses to
+start without them (fail-fast instead of silently running with a broken
+control plane).
 
 Per-board tuning lives in the database (`lane_boards` table):
 

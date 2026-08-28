@@ -2,8 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log"
-	"strings"
 	"time"
 )
 
@@ -14,6 +15,7 @@ import (
 //   - upstream_status_code IS NULL（网络错误）或
 //   - upstream_status_code >= 500（上游 5xx）或
 //   - upstream_status_code = 429（限流）
+//
 // 排除 4xx 业务错误（model_not_found / 参数错误等属于配置问题，不是健康问题）
 func (d *DB) CountModelFailures(ctx context.Context, model string, accountIDs []int64, window time.Duration) (map[int64]int, error) {
 	if len(accountIDs) == 0 {
@@ -51,8 +53,11 @@ GROUP BY account_id`,
 
 func (d *DB) SetAccountState(ctx context.Context, boardID, accountID int64, state string, disabledAt *time.Time) error {
 	_, err := d.pool.Exec(ctx, `
-UPDATE lane_account_states SET state=$3, disabled_at=$4
-WHERE board_id=$1 AND account_id=$2`, boardID, accountID, state, disabledAt)
+INSERT INTO lane_account_states (board_id, account_id, state, disabled_at)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (board_id, account_id) DO UPDATE SET
+  state=EXCLUDED.state,
+  disabled_at=EXCLUDED.disabled_at`, boardID, accountID, state, disabledAt)
 	return err
 }
 
@@ -90,81 +95,6 @@ WHERE board_id=$1 AND account_id=$2`, boardID, accountID, at, ok, msg)
 	return err
 }
 
-// ============================ model_rate_limits 控制 ============================
-
-// SetModelRateLimitIfIdle 写入手动禁用条目，仅当该模型当前没有活跃的自动限流条目
-// 返回是否真的写入（false = 上游自动限流已在管，不覆盖）
-//
-// 坑：jsonb_set 的 path 不能创建不存在的两级路径！当 extra 里没有 model_rate_limits
-// 键时，jsonb_set(extra, ARRAY['model_rate_limits',$2], ...) 是 no-op（返回原值），
-// 但 updated_at 变化会让 RowsAffected=1 造成"写入成功"假象。
-// 正确写法：COALESCE(extra->'model_rate_limits','{}') || jsonb_build_object(...) 合并后，
-// 用 jsonb_set 写单层 '{model_rate_limits}' 路径（单层缺失可创建）。
-func (d *DB) SetModelRateLimitIfIdle(ctx context.Context, accountID int64, model, entryJSON string) (bool, error) {
-	tag, err := d.pool.Exec(ctx, `
-UPDATE accounts
-SET extra = jsonb_set(
-      COALESCE(extra, '{}'::jsonb),
-      '{model_rate_limits}',
-      COALESCE(COALESCE(extra, '{}'::jsonb) -> 'model_rate_limits', '{}'::jsonb)
-        || jsonb_build_object($2::text, $3::jsonb),
-      true),
-    updated_at = now()
-WHERE id = $1 AND deleted_at IS NULL
-  AND (
-    NOT (COALESCE(extra, '{}'::jsonb) -> 'model_rate_limits' ? $2::text)
-    OR (COALESCE(extra, '{}'::jsonb) -> 'model_rate_limits' -> $2::text ->> 'rate_limit_reset_at') IS NULL
-    OR (COALESCE(extra, '{}'::jsonb) -> 'model_rate_limits' -> $2::text ->> 'rate_limit_reset_at')::timestamptz < now()
-  )`,
-		accountID, model, entryJSON)
-	if err != nil {
-		return false, err
-	}
-	return tag.RowsAffected() > 0, nil
-}
-
-// ClearModelRateLimitIfOwned 删除自己写入的 failed 禁用条目（reason = lane_board:<board>），返回是否删除
-// suppressed 条目（lane_board:suppressed:*）和 sub2api 自动限流条目不动
-// 注意：不能用 `-> 'model_rate_limits' - $2` —— PG 会把 key 字面量误解析为 jsonb
-// （jsonb - jsonb 重载优先于 jsonb - text），报 "invalid input syntax for type json"。
-// 必须用 jsonb_delete() 函数显式指定 text 语义。
-func (d *DB) ClearModelRateLimitIfOwned(ctx context.Context, accountID int64, model, boardName string) (bool, error) {
-	tag, err := d.pool.Exec(ctx, `
-UPDATE accounts
-SET extra = jsonb_set(
-      COALESCE(extra, '{}'::jsonb),
-      '{model_rate_limits}',
-      jsonb_delete(COALESCE(extra, '{}'::jsonb) -> 'model_rate_limits', $2::text),
-      true),
-    updated_at = now()
-WHERE id = $1 AND deleted_at IS NULL
-  AND COALESCE(extra, '{}'::jsonb) -> 'model_rate_limits' -> $2::text ->> 'reason' = 'lane_board:' || $3::text`,
-		accountID, model, boardName)
-	if err != nil {
-		return false, err
-	}
-	return tag.RowsAffected() > 0, nil
-}
-
-// ClearSuppressIfOwned 删除抑制条目（reason LIKE lane_board:suppressed:%），返回是否删除
-func (d *DB) ClearSuppressIfOwned(ctx context.Context, accountID int64, model string) (bool, error) {
-	tag, err := d.pool.Exec(ctx, `
-UPDATE accounts
-SET extra = jsonb_set(
-      COALESCE(extra, '{}'::jsonb),
-      '{model_rate_limits}',
-      jsonb_delete(COALESCE(extra, '{}'::jsonb) -> 'model_rate_limits', $2::text),
-      true),
-    updated_at = now()
-WHERE id = $1 AND deleted_at IS NULL
-  AND COALESCE(extra, '{}'::jsonb) -> 'model_rate_limits' -> $2::text ->> 'reason' LIKE 'lane\_board:suppressed:%'`,
-		accountID, model)
-	if err != nil {
-		return false, err
-	}
-	return tag.RowsAffected() > 0, nil
-}
-
 // ============================ 事件记录 ============================
 
 // LogLaneEvent 泳道图事件写入 switch_history（复用现有历史表）
@@ -185,37 +115,36 @@ VALUES ($1,$2,$3,$4,0,0,'laneboard','success',$5)`,
 	}
 }
 
-
-// ExternalBlock 外部抑制信息：sub2api 原生机制挡住调度（非泳道图写入）
+// ExternalBlock 是 Sub2API 原生机制施加的调度阻塞（泳道图不覆盖）。
 type ExternalBlock struct {
-	// 账号级调度开关（sub2api 可自动关闭：连续失败/暂停）
 	Schedulable bool
-	// 账号状态（active 之外都不可调度）
-	Status string
-	// 原生 model_rate_limits 冷却：reason 非 lane_board: 前缀且 rate_limit_reset_at > now
+	Status      string
+
+	// 账号过期自动暂停、API key/Bedrock 配额阻塞。
+	Expired       bool
+	QuotaExceeded bool
+	// 当前 board 自己的模型限制，用于发现“本地 healthy、远端仍阻断”的失配。
+	OwnedModelLimit bool
+	// 原生 model_rate_limits 中的未来冷却（其它 owner 也视为外部阻塞）。
 	NativeCoolUntil *time.Time
-	// 账号级临时禁调度
+	// 账号级运行时限流、过载和临时禁调度都会被 Sub2API 调度器跳过。
+	RateLimitUntil   *time.Time
+	OverloadUntil    *time.Time
 	TempUnschedUntil *time.Time
 }
 
-// blocked 是否当前被外部抑制
 func (e ExternalBlock) blocked(now time.Time) bool {
-	if !e.Schedulable {
+	if !e.Schedulable || e.Status != "active" || e.Expired || e.QuotaExceeded {
 		return true
 	}
-	if e.Status != "active" {
-		return true
-	}
-	if e.NativeCoolUntil != nil && e.NativeCoolUntil.After(now) {
-		return true
-	}
-	if e.TempUnschedUntil != nil && e.TempUnschedUntil.After(now) {
-		return true
+	for _, until := range []*time.Time{e.NativeCoolUntil, e.RateLimitUntil, e.OverloadUntil, e.TempUnschedUntil} {
+		if until != nil && until.After(now) {
+			return true
+		}
 	}
 	return false
 }
 
-// blockedReason 外部抑制描述（UI/日志用）
 func (e ExternalBlock) blockedReason(now time.Time) string {
 	if !e.Schedulable {
 		return "账号调度开关关闭"
@@ -223,8 +152,20 @@ func (e ExternalBlock) blockedReason(now time.Time) string {
 	if e.Status != "active" {
 		return "账号状态 " + e.Status
 	}
+	if e.Expired {
+		return "账号已过期"
+	}
+	if e.QuotaExceeded {
+		return "账号配额已用尽"
+	}
 	if e.NativeCoolUntil != nil && e.NativeCoolUntil.After(now) {
-		return "上游冷却至 " + e.NativeCoolUntil.In(time.FixedZone("CST", 8*3600)).Format("15:04")
+		return "模型级上游冷却至 " + e.NativeCoolUntil.In(time.FixedZone("CST", 8*3600)).Format("15:04")
+	}
+	if e.RateLimitUntil != nil && e.RateLimitUntil.After(now) {
+		return "账号级限流至 " + e.RateLimitUntil.In(time.FixedZone("CST", 8*3600)).Format("15:04")
+	}
+	if e.OverloadUntil != nil && e.OverloadUntil.After(now) {
+		return "账号过载至 " + e.OverloadUntil.In(time.FixedZone("CST", 8*3600)).Format("15:04")
 	}
 	if e.TempUnschedUntil != nil && e.TempUnschedUntil.After(now) {
 		return "临时禁调度至 " + e.TempUnschedUntil.In(time.FixedZone("CST", 8*3600)).Format("15:04")
@@ -232,48 +173,126 @@ func (e ExternalBlock) blockedReason(now time.Time) string {
 	return ""
 }
 
-// GetExternalBlocks 查询一批账号的外部抑制状态（泳道图不写、只感知）
-// 原生冷却 = model_rate_limits.<model> 中 reason 非 lane_board: 前缀且 rate_limit_reset_at > now
-// 临时禁调度 = temp_unschedulable_until > now
-func (d *DB) GetExternalBlocks(ctx context.Context, accountIDs []int64, model string) (map[int64]ExternalBlock, error) {
+// GetExternalBlocks 查询账号级和目标模型级的 Sub2API 原生调度阻塞。
+// 模型级限制按账号的 model_mapping 解析；只有当前 board 自己的 owner 条目会被排除。
+func (d *DB) GetExternalBlocks(ctx context.Context, accountIDs []int64, model, boardName string) (map[int64]ExternalBlock, error) {
 	out := make(map[int64]ExternalBlock, len(accountIDs))
 	if len(accountIDs) == 0 {
 		return out, nil
 	}
 	rows, err := d.pool.Query(ctx, `
-SELECT id, schedulable, status,
-  (COALESCE(extra, '{}'::jsonb) -> 'model_rate_limits' -> $2::text ->> 'rate_limit_reset_at')::timestamptz AS cool_until,
-  (COALESCE(extra, '{}'::jsonb) -> 'model_rate_limits' -> $2::text ->> 'reason') AS cool_reason,
-  temp_unschedulable_until
+SELECT id, platform, type, schedulable, status,
+       rate_limit_reset_at, overload_until, temp_unschedulable_until,
+       auto_pause_on_expired, expires_at,
+       credentials->'model_mapping',
+       COALESCE(credentials->>'oauth_type', ''),
+       COALESCE(credentials->>'project_id', ''),
+       COALESCE((extra->>'openai_passthrough') = 'true', false),
+       COALESCE((extra->>'openai_oauth_passthrough') = 'true', false),
+       extra->'model_rate_limits',
+       jsonb_build_object(
+         'quota_limit', extra->'quota_limit',
+         'quota_used', extra->'quota_used',
+         'quota_reset_timezone', extra->'quota_reset_timezone',
+          'quota_daily_limit', extra->'quota_daily_limit',
+         'quota_daily_used', extra->'quota_daily_used',
+         'quota_daily_start', extra->'quota_daily_start',
+         'quota_daily_reset_mode', extra->'quota_daily_reset_mode',
+          'quota_daily_reset_hour', extra->'quota_daily_reset_hour',
+         'quota_daily_reset_at', extra->'quota_daily_reset_at',
+         'quota_weekly_limit', extra->'quota_weekly_limit',
+         'quota_weekly_used', extra->'quota_weekly_used',
+         'quota_weekly_start', extra->'quota_weekly_start',
+         'quota_weekly_reset_mode', extra->'quota_weekly_reset_mode',
+          'quota_weekly_reset_day', extra->'quota_weekly_reset_day',
+          'quota_weekly_reset_hour', extra->'quota_weekly_reset_hour',
+         'quota_weekly_reset_at', extra->'quota_weekly_reset_at'
+       ) AS quota_state
 FROM accounts
-WHERE id = ANY($1) AND deleted_at IS NULL`,
-		accountIDs, model)
+WHERE id = ANY($1) AND deleted_at IS NULL`, accountIDs)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	now := time.Now()
 	for rows.Next() {
 		var id int64
+		var platform, accountType string
 		var schedulable bool
 		var status string
-		var coolUntil, tempUntil *time.Time
-		var coolReason *string
-		if err := rows.Scan(&id, &schedulable, &status, &coolUntil, &coolReason, &tempUntil); err != nil {
+		var autoPauseOnExpired bool
+		var expiresAt *time.Time
+		var rateLimitUntil, overloadUntil, tempUntil *time.Time
+		var mappingJSON, limitsJSON, quotaJSON []byte
+		var oauthType, projectID string
+		var passThrough, oauthPassThrough bool
+		if err := rows.Scan(&id, &platform, &accountType, &schedulable, &status,
+			&rateLimitUntil, &overloadUntil, &tempUntil, &autoPauseOnExpired, &expiresAt,
+			&mappingJSON, &oauthType, &projectID, &passThrough, &oauthPassThrough,
+			&limitsJSON, &quotaJSON); err != nil {
 			return nil, err
 		}
-		var eb ExternalBlock
-		eb.Schedulable = schedulable
-		eb.Status = status
-		// 原生冷却：仅当 reason 非 lane_board: 前缀（泳道图自己的条目不算外部抑制）
-		if coolUntil != nil && (coolReason == nil || !strings.HasPrefix(*coolReason, "lane_board:")) {
-			eb.NativeCoolUntil = coolUntil
+
+		mapping := make(map[string]any)
+		if len(mappingJSON) > 0 && string(mappingJSON) != "null" {
+			if err := json.Unmarshal(mappingJSON, &mapping); err != nil {
+				return nil, fmt.Errorf("decode account %d model mapping: %w", id, err)
+			}
 		}
-		eb.TempUnschedUntil = tempUntil
+		credentials := map[string]any{
+			"model_mapping":            mapping,
+			"oauth_type":               oauthType,
+			"project_id":               projectID,
+			"openai_passthrough":       passThrough,
+			"openai_oauth_passthrough": oauthPassThrough,
+		}
+		limits := make(map[string]any)
+		if len(limitsJSON) > 0 && string(limitsJSON) != "null" {
+			if err := json.Unmarshal(limitsJSON, &limits); err != nil {
+				return nil, fmt.Errorf("decode account %d model rate limits: %w", id, err)
+			}
+		}
+		quotaState := make(map[string]any)
+		if len(quotaJSON) > 0 && string(quotaJSON) != "null" {
+			if err := json.Unmarshal(quotaJSON, &quotaState); err != nil {
+				return nil, fmt.Errorf("decode account %d quota state: %w", id, err)
+			}
+		}
+
+		eb := ExternalBlock{
+			Schedulable:      schedulable,
+			Status:           status,
+			RateLimitUntil:   rateLimitUntil,
+			OverloadUntil:    overloadUntil,
+			TempUnschedUntil: tempUntil,
+			Expired:          autoPauseOnExpired && expiresAt != nil && !expiresAt.After(now),
+			QuotaExceeded:    (accountType == "apikey" || accountType == "bedrock") && accountQuotaExceeded(quotaState, now),
+		}
+		account := &SubAccount{Platform: platform, Type: accountType, Credentials: credentials, Extra: credentials}
+		for _, modelKey := range accountModelRateLimitKeys(account, model) {
+			entry, exists := limits[modelKey]
+			if !exists {
+				continue
+			}
+			modelReset := modelRateLimitResetAt(entry)
+			if modelReset == nil {
+				continue
+			}
+			if !modelReset.After(now) {
+				continue
+			}
+			if modelRateLimitEntryOwnedBy(entry, boardName) {
+				eb.OwnedModelLimit = true
+				continue
+			}
+			if eb.NativeCoolUntil == nil || modelReset.After(*eb.NativeCoolUntil) {
+				eb.NativeCoolUntil = modelReset
+			}
+		}
 		out[id] = eb
 	}
 	return out, rows.Err()
 }
-
 
 // LastSuccessfulCalls 查一批账号在窗口内、指定模型最近一次实际调用成功的时间（usage_logs 只记成功请求）
 func (d *DB) LastSuccessfulCalls(ctx context.Context, accountIDs []int64, model string, window time.Duration) (map[int64]time.Time, error) {
@@ -302,16 +321,4 @@ GROUP BY account_id`,
 		out[id] = at
 	}
 	return out, rows.Err()
-}
-
-// HasSuppressEntry 检查账号是否存在泳道图抑制条目（reason LIKE lane_board:suppressed:%）
-func (d *DB) HasSuppressEntry(ctx context.Context, accountID int64, model string) (bool, error) {
-	var has bool
-	err := d.pool.QueryRow(ctx, `
-SELECT EXISTS(
-  SELECT 1 FROM accounts
-  WHERE id = $1 AND deleted_at IS NULL
-    AND COALESCE(extra, '{}'::jsonb) -> 'model_rate_limits' -> $2::text ->> 'reason' LIKE 'lane\_board:suppressed:%'
-)`, accountID, model).Scan(&has)
-	return has, err
 }

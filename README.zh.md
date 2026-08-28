@@ -25,7 +25,8 @@
 - **探测** 被禁用账号，一旦恢复健康就自动启用——但**真实流量仍在失败的账号不会被重新启用**（防乒乓）；
 - **多模型并存**，各自独立泳道互不干扰。
 
-所有控制都走 Sub2API 官方管理 API——不直接写库、不产生调度缓存不一致、切换后不会出现莫名 503。
+模型限流变更通过共享 PostgreSQL 行锁事务和 `account_changed` outbox 原子完成；探测和账号级
+调度开关仍调用 Sub2API Admin API。这样不会产生 GET/PUT 丢失更新，也能持续刷新网关调度快照。
 
 ---
 
@@ -35,7 +36,7 @@
 - **滚动失败检测** — 统计滑动窗口（默认 60s）内的上游 5xx / 429 / 网络错误，超阈值禁用账号。
 - **探测 + 恢复门槛** — 被禁用账号用真实 upstream 调用探测；只有**探测通过 且 真实流量窗口内无失败**才恢复，防止坏账号反复横跳。
 - **感知外部状态** — 尊重 Sub2API 自身的 schedulable 开关、status、冷却、模型限流；对网关自己关闭的账号防抖重开，不与网关打架。
-- **调度缓存一致** — 全部控制走 Sub2API admin API，经 outbox 失效其 Redis 快照——DB 与调度器永远同步。
+- **调度缓存一致** — 模型限流更新与共享 PostgreSQL 行锁、`account_changed` outbox 原子完成；探测和账号开关走 Sub2API Admin API。
 - **Web 看板** — 每模型一页，显示泳道状态、失败数、探测状态、手动探测按钮。
 - **自托管** — 单个静态 Go 二进制，监听 localhost，YAML 配置。
 
@@ -45,9 +46,10 @@
 
 ### 前置
 
-- 一个运行中的 [Sub2API](https://github.com/Wei-Shaw/sub2api)（含 PostgreSQL 和 Redis）。
+- 一个已应用 `scheduler_outbox` 迁移的最新 [Sub2API](https://github.com/Wei-Shaw/sub2api) 实例（含 PostgreSQL 和 Redis）。
 - Sub2API 的 Admin API Key（Server → API Keys → Admin API Key）。
-- Sub2API 数据库里的 `lane_*` 表（见[数据库初始化](#数据库初始化)）。
+- `database.dsn` 使用的 PostgreSQL 用户需要具备读写 `accounts`、创建/迁移调度器 `lane_*` 表以及写入
+  `scheduler_outbox` 的权限。
 
 ### 编译
 
@@ -59,7 +61,7 @@ go build -o sub2api-scheduler .
 
 ```bash
 cp config.example.yaml config.yaml
-# 编辑：database DSN、sub2api base_url + admin_api_key、redis addr
+# 编辑：database DSN、sub2api base_url + admin_api_key
 ```
 
 ### 运行
@@ -75,53 +77,18 @@ cp config.example.yaml config.yaml
 
 ## 数据库初始化
 
-调度器复用 Sub2API 的共享库。在 Sub2API 同一个 PostgreSQL 里建泳道相关表（一次性执行）：
+无需手工执行 SQL。守护进程启动时会在 Sub2API PostgreSQL 数据库中自动创建并迁移
+`lane_boards`、`lane_boards_lanes` 和 `lane_account_states`。旧版 README
+创建的表也会自动补齐泳道 ID、默认值、状态行和唯一约束。
 
-```sql
-CREATE TABLE IF NOT EXISTS lane_boards (
-    id              BIGSERIAL PRIMARY KEY,
-    name            TEXT NOT NULL,
-    model           TEXT NOT NULL,
-    enabled         BOOLEAN NOT NULL DEFAULT true,
-    fail_threshold  INT NOT NULL DEFAULT 3,
-    window_seconds  INT NOT NULL DEFAULT 60,
-    probe_interval  INT NOT NULL DEFAULT 30,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+请通过 Web 看板创建和编辑泳道图。每个模型只能属于一个泳道图，同一账号在图中只能出现一次；账号需要按照 Sub2API 的显式 mapping、平台默认 mapping
+或透传规则支持该模型。
 
-CREATE TABLE IF NOT EXISTS lane_boards_lanes (
-    board_id    BIGINT NOT NULL REFERENCES lane_boards(id) ON DELETE CASCADE,
-    position    INT NOT NULL,
-    name        TEXT NOT NULL,
-    account_ids BIGINT[] NOT NULL,
-    PRIMARY KEY (board_id, position)
-);
+如果存量数据存在重复的泳道图名称、模型或同一图内的账号归属，启动迁移会主动失败，需
+先清理重复数据再重启。迁移也会忽略旧账号 ID 数组中的 NULL 和非正数元素。
 
-CREATE TABLE IF NOT EXISTS lane_account_states (
-    board_id       BIGINT NOT NULL REFERENCES lane_boards(id) ON DELETE CASCADE,
-    account_id     BIGINT NOT NULL,
-    state          TEXT NOT NULL DEFAULT 'healthy',  -- healthy | disabled | suppressed
-    fail_count     INT NOT NULL DEFAULT 0,
-    disabled_at    TIMESTAMPTZ,
-    checked_at     TIMESTAMPTZ,
-    last_probe_at  TIMESTAMPTZ,
-    last_probe_ok  BOOLEAN,
-    last_probe_msg TEXT,
-    PRIMARY KEY (board_id, account_id)
-);
-```
-
-然后插入泳道图：每个图对应一个模型和它的泳道，例如
-
-```sql
-INSERT INTO lane_boards (name, model) VALUES ('my-flash', 'flash-v1');
-
-INSERT INTO lane_boards_lanes (board_id, position, name, account_ids) VALUES
-(1, 0, 'primary-proxy',   '{11}'),
-(1, 1, 'reseller',        '{22}'),
-(1, 2, 'official',        '{33}');
-```
+同一个数据库同一时间只能运行一个调度器实例；启动时会获取 PostgreSQL advisory lock，
+第二个实例会直接拒绝启动。
 
 调度器从左到右取泳道；第一个存在健康账号的泳道为 active。
 
@@ -146,8 +113,9 @@ INSERT INTO lane_boards_lanes (board_id, position, name, account_ids) VALUES
         │   压制低泳道                 │
         │   释放并验证高泳道           │
         └──────────┬───────────────────┘
-                   │ admin API (PUT/POST/DELETE)
-                   ▼
+                    │ PostgreSQL 行锁 + account_changed outbox
+                    │ admin API（探测 / schedulable）
+                    ▼
         ┌──────────────────────────────┐
         │  Sub2API 网关                │
         │  账号调度快照                │
@@ -178,12 +146,14 @@ INSERT INTO lane_boards_lanes (board_id, position, name, account_ids) VALUES
 
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
+| `server.host` | `127.0.0.1` | 监听地址（设为 `0.0.0.0` 可对外暴露） |
 | `server.port` | `8090` | 看板端口 |
-| `database.dsn` | — | Sub2API PostgreSQL DSN |
+| `database.dsn` | — | Sub2API PostgreSQL DSN（**必填**） |
 | `sub2api.base_url` | `http://sub2api:8080` | Sub2API 内部 API |
-| `sub2api.admin_api_key` | — | Sub2API Admin API Key |
-| `redis.addr` | `redis:6379` | Sub2API Redis |
-| `redis.password` | — | Redis 密码 |
+| `sub2api.admin_api_key` | — | Sub2API Admin API Key（**必填**） |
+
+`database.dsn` 与 `sub2api.admin_api_key` 为必填项：缺失时守护进程直接拒绝启动
+（fail-fast），避免带着失控的控制面静默运行。
 
 每个泳道图的调参在数据库里（`lane_boards` 表）：
 

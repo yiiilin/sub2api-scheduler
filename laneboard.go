@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
-	"strings"
 	"sync"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // ============================================================================
@@ -29,10 +32,10 @@ import (
 //   - 探测范围 = active 泳道及以上泳道的 disabled 账号（active 内挂掉的 + 更高泳道候选）；
 //     active 之下的 disabled 不探测（没资格接管，等上游全挂升为候选再恢复）
 //
-// 控制手段（模型级）：
-//   - 禁用:  写 accounts.extra.model_rate_limits.<model>（rate_limit_reset_at=null 手动禁用）
-//   - 恢复:  删除自己写入的条目（reason 前缀 lane_board:），sub2api 自动限流条目不动
-//   - 每次变更后 DEL Redis sched:acc:<id>（调度缓存 TTL=-1 持久，必须清）
+// 控制手段（模型级）
+//   - 禁用/恢复: 通过共享 PostgreSQL 账号行锁事务更新 model_rate_limits，并写入 scheduler_outbox
+//   - 恢复仅删除自己写入的条目（reason 为当前 board 的精确 owner）
+//   - model_rate_limits 使用账号映射后的上游模型键；outbox 负责调度快照同步
 // ============================================================================
 
 // LaneBoard 泳道图（= 一个模型）
@@ -62,12 +65,12 @@ type Lane struct {
 type AccountState struct {
 	BoardID      int64      `json:"board_id"`
 	AccountID    int64      `json:"account_id"`
-	State        string     `json:"state"` // healthy / disabled
+	State        string     `json:"state"` // healthy / disabled / suppressed
 	DisabledAt   *time.Time `json:"disabled_at"`
 	LastProbeAt  *time.Time `json:"last_probe_at"`
 	LastProbeOK  *bool      `json:"last_probe_ok"`
 	LastProbeMsg string     `json:"last_probe_msg"`
-	FailCount    int        `json:"fail_count"` // 最近一次错误窗口计数
+	FailCount    int        `json:"fail_count"` // 连续探测失败次数
 	CheckedAt    *time.Time `json:"checked_at"`
 }
 
@@ -77,16 +80,15 @@ const (
 	LaneStateSuppressed = "suppressed" // 被更高优先级泳道压制（即使健康也不调度）
 	laneReasonPrefix    = "lane_board:"
 	laneSuppressPrefix  = "lane_board:suppressed:"
-	// 压制/禁用条目用遥远未来时间戳而非 null：
-	// 官方 UI 只渲染 rate_limit_reset_at 在未来 的条目（null 视为"手动禁用"不显示）；
-	// 2099 永不过期 → 调度器持续不调度，sub2api 也不会自动清理
+	// Sub2API 只有在 rate_limit_reset_at 是未来时间时才把模型条目视为有效；
+	// 使用 2099 保持阻断，直到本调度器通过管理 API 精确清理 owner 条目。
 	laneFarFuture = "2099-12-31T23:59:59Z"
 )
 
 // ============================ Schema ============================
 
 func (d *DB) ensureLaneBoardSchema(ctx context.Context) error {
-	stmts := []string{
+	createStatements := []string{
 		`CREATE TABLE IF NOT EXISTS lane_boards (
 			id              BIGSERIAL PRIMARY KEY,
 			name            TEXT NOT NULL UNIQUE,
@@ -118,9 +120,77 @@ func (d *DB) ensureLaneBoardSchema(ctx context.Context) error {
 			PRIMARY KEY (board_id, account_id)
 		)`,
 	}
-	for _, s := range stmts {
-		if _, err := d.pool.Exec(ctx, s); err != nil {
+	for _, statement := range createStatements {
+		if _, err := d.pool.Exec(ctx, statement); err != nil {
 			return err
+		}
+	}
+
+	// Upgrade tables created by older README versions. Those definitions lacked
+	// lane IDs, defaults, and state rows; CREATE TABLE IF NOT EXISTS cannot repair
+	// an existing table.
+	migrationStatements := []string{
+		`CREATE SEQUENCE IF NOT EXISTS lane_boards_lanes_id_seq`,
+		`ALTER TABLE lane_boards_lanes ADD COLUMN IF NOT EXISTS id BIGINT`,
+		`ALTER TABLE lane_boards_lanes ALTER COLUMN id SET DEFAULT nextval('lane_boards_lanes_id_seq')`,
+		`UPDATE lane_boards_lanes SET id=nextval('lane_boards_lanes_id_seq') WHERE id IS NULL`,
+		`SELECT setval('lane_boards_lanes_id_seq', COALESCE((SELECT MAX(id) FROM lane_boards_lanes), 0) + 1, false)`,
+		`ALTER TABLE lane_boards_lanes ALTER COLUMN id SET NOT NULL`,
+		`ALTER TABLE lane_boards_lanes ALTER COLUMN position SET DEFAULT 0`,
+		`ALTER TABLE lane_boards_lanes ALTER COLUMN name SET DEFAULT ''`,
+		`ALTER TABLE lane_boards_lanes ALTER COLUMN account_ids SET DEFAULT '{}'::bigint[]`,
+		`UPDATE lane_boards_lanes SET account_ids=ARRAY(
+		   SELECT account_id FROM unnest(COALESCE(account_ids, '{}'::bigint[])) AS account_id
+		   WHERE account_id > 0
+		)`,
+		`UPDATE lane_boards SET fail_threshold=3 WHERE fail_threshold IS NULL OR fail_threshold <= 0`,
+		`UPDATE lane_boards SET window_seconds=60 WHERE window_seconds IS NULL OR window_seconds < 10`,
+		`UPDATE lane_boards SET probe_interval=30 WHERE probe_interval IS NULL OR probe_interval < 10`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS lane_boards_lanes_id_key ON lane_boards_lanes(id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS lane_boards_lanes_board_position_key ON lane_boards_lanes(board_id, position)`,
+		`ALTER TABLE lane_account_states ADD COLUMN IF NOT EXISTS disabled_at TIMESTAMPTZ`,
+		`ALTER TABLE lane_account_states ADD COLUMN IF NOT EXISTS last_probe_at TIMESTAMPTZ`,
+		`ALTER TABLE lane_account_states ADD COLUMN IF NOT EXISTS last_probe_ok BOOLEAN`,
+		`ALTER TABLE lane_account_states ADD COLUMN IF NOT EXISTS last_probe_msg TEXT`,
+		`ALTER TABLE lane_account_states ADD COLUMN IF NOT EXISTS fail_count INT`,
+		`ALTER TABLE lane_account_states ADD COLUMN IF NOT EXISTS checked_at TIMESTAMPTZ`,
+		`UPDATE lane_account_states SET last_probe_msg='' WHERE last_probe_msg IS NULL`,
+		`UPDATE lane_account_states SET fail_count=0 WHERE fail_count IS NULL`,
+		`ALTER TABLE lane_account_states ALTER COLUMN last_probe_msg SET DEFAULT ''`,
+		`ALTER TABLE lane_account_states ALTER COLUMN last_probe_msg SET NOT NULL`,
+		`ALTER TABLE lane_account_states ALTER COLUMN fail_count SET DEFAULT 0`,
+		`ALTER TABLE lane_account_states ALTER COLUMN fail_count SET NOT NULL`,
+		`INSERT INTO lane_account_states (board_id, account_id)
+		 SELECT lanes.board_id, account_ids.account_id
+		 FROM lane_boards_lanes AS lanes
+		 CROSS JOIN LATERAL unnest(lanes.account_ids) AS account_ids(account_id)
+		 WHERE account_ids.account_id IS NOT NULL
+		 ON CONFLICT (board_id, account_id) DO NOTHING`,
+		`DO $$
+		 BEGIN
+		   IF EXISTS (SELECT 1 FROM lane_boards GROUP BY name HAVING count(*) > 1) THEN
+		     RAISE EXCEPTION 'duplicate lane board names must be resolved before migration';
+		   END IF;
+		   IF EXISTS (SELECT 1 FROM lane_boards GROUP BY model HAVING count(*) > 1) THEN
+		     RAISE EXCEPTION 'duplicate lane board models must be resolved before migration';
+		   END IF;
+		   IF EXISTS (
+		     SELECT lanes.board_id, account_ids.account_id
+		     FROM lane_boards_lanes AS lanes
+		     CROSS JOIN LATERAL unnest(lanes.account_ids) AS account_ids(account_id)
+		     WHERE account_ids.account_id IS NOT NULL AND account_ids.account_id > 0
+		     GROUP BY lanes.board_id, account_ids.account_id
+		     HAVING count(*) > 1
+		   ) THEN
+		     RAISE EXCEPTION 'duplicate lane account memberships must be resolved before migration';
+		   END IF;
+		 END $$`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS lane_boards_name_key ON lane_boards(name)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS lane_boards_model_key ON lane_boards(model)`,
+	}
+	for _, statement := range migrationStatements {
+		if _, err := d.pool.Exec(ctx, statement); err != nil {
+			return fmt.Errorf("migrate lane board schema: %w", err)
 		}
 	}
 	return nil
@@ -160,7 +230,11 @@ FROM lane_boards ORDER BY id ASC`)
 
 func (d *DB) ListLanes(ctx context.Context, boardID int64) ([]Lane, error) {
 	rows, err := d.pool.Query(ctx, `
-SELECT id, board_id, position, name, account_ids
+SELECT id, board_id, position, name,
+       COALESCE(ARRAY(
+         SELECT account_id FROM unnest(COALESCE(account_ids, '{}'::bigint[])) AS account_id
+         WHERE account_id > 0
+       ), '{}'::bigint[])
 FROM lane_boards_lanes WHERE board_id=$1 ORDER BY position ASC, id ASC`, boardID)
 	if err != nil {
 		return nil, err
@@ -185,6 +259,9 @@ FROM lane_boards WHERE id=$1`, id).
 		Scan(&b.ID, &b.Name, &b.Model, &b.Enabled, &b.FailThreshold,
 			&b.WindowSeconds, &b.ProbeInterval, &b.CreatedAt, &b.UpdatedAt)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("%w: board %d", ErrBoardNotFound, id)
+		}
 		return nil, err
 	}
 	lanes, err := d.ListLanes(ctx, id)
@@ -212,6 +289,16 @@ func (d *DB) SaveBoard(ctx context.Context, b *LaneBoard) error {
 	}
 	defer tx.Rollback(ctx)
 
+	var previousModel string
+	if b.ID != 0 {
+		if err := tx.QueryRow(ctx, `SELECT model FROM lane_boards WHERE id=$1 FOR UPDATE`, b.ID).Scan(&previousModel); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("%w: board %d", ErrBoardNotFound, b.ID)
+			}
+			return err
+		}
+	}
+
 	if b.ID == 0 {
 		err = tx.QueryRow(ctx, `
 INSERT INTO lane_boards (name, model, enabled, fail_threshold, window_seconds, probe_interval)
@@ -224,17 +311,7 @@ UPDATE lane_boards SET name=$2, model=$3, enabled=$4, fail_threshold=$5, window_
 WHERE id=$1`,
 			b.ID, b.Name, b.Model, b.Enabled, b.FailThreshold, b.WindowSeconds, b.ProbeInterval)
 		if err == nil {
-			// 全量替换泳道
 			if _, err = tx.Exec(ctx, `DELETE FROM lane_boards_lanes WHERE board_id=$1`, b.ID); err != nil {
-				return err
-			}
-			// 清理不再存在的账号状态
-			if _, err = tx.Exec(ctx, `
-DELETE FROM lane_account_states WHERE board_id=$1 AND NOT (account_id = ANY(
-  (SELECT array_agg(aid) FROM (
-    SELECT unnest(account_ids) AS aid FROM lane_boards_lanes WHERE board_id=$1
-  ) t WHERE aid IS NOT NULL)::bigint[]
-))`, b.ID); err != nil {
 				return err
 			}
 		}
@@ -262,12 +339,91 @@ ON CONFLICT (board_id, account_id) DO NOTHING`, b.ID, aid); err != nil {
 			}
 		}
 	}
+	accountIDs := uniqueBoardAccountIDs(b)
+	if accountIDs == nil {
+		accountIDs = []int64{}
+	}
+	if _, err := tx.Exec(ctx, `
+DELETE FROM lane_account_states
+WHERE board_id=$1 AND NOT (account_id = ANY($2))`, b.ID, accountIDs); err != nil {
+		return err
+	}
+	if b.ID != 0 && previousModel != b.Model {
+		if _, err := tx.Exec(ctx, `
+UPDATE lane_account_states
+SET state='healthy', disabled_at=NULL, last_probe_at=NULL, last_probe_ok=NULL,
+    last_probe_msg='', fail_count=0, checked_at=NULL
+WHERE board_id=$1`, b.ID); err != nil {
+			return err
+		}
+	}
 	return tx.Commit(ctx)
 }
 
 func (d *DB) DeleteBoard(ctx context.Context, id int64) error {
-	_, err := d.pool.Exec(ctx, `DELETE FROM lane_boards WHERE id=$1`, id)
-	return err
+	tag, err := d.pool.Exec(ctx, `DELETE FROM lane_boards WHERE id=$1`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: board %d", ErrBoardNotFound, id)
+	}
+	return nil
+}
+
+func (d *DB) ValidateBoardAccounts(ctx context.Context, model string, accountIDs []int64) error {
+	if len(accountIDs) == 0 {
+		return fmt.Errorf("%w: at least one account is required", ErrInvalidBoard)
+	}
+	rows, err := d.pool.Query(ctx, `
+SELECT id, platform, type,
+       credentials->'model_mapping',
+       COALESCE(credentials->>'oauth_type', ''),
+       COALESCE(credentials->>'project_id', ''),
+       COALESCE((extra->>'openai_passthrough') = 'true', false),
+       COALESCE((extra->>'openai_oauth_passthrough') = 'true', false)
+FROM accounts
+WHERE deleted_at IS NULL
+  AND id = ANY($1)`, accountIDs)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	found := make(map[int64]struct{}, len(accountIDs))
+	for rows.Next() {
+		var id int64
+		var platform, accountType, oauthType, projectID string
+		var passThrough, oauthPassThrough bool
+		var mappingJSON []byte
+		if err := rows.Scan(&id, &platform, &accountType, &mappingJSON, &oauthType, &projectID, &passThrough, &oauthPassThrough); err != nil {
+			return err
+		}
+		credentials := map[string]any{
+			"oauth_type":               oauthType,
+			"project_id":               projectID,
+			"openai_passthrough":       passThrough,
+			"openai_oauth_passthrough": oauthPassThrough,
+		}
+		if len(mappingJSON) > 0 && string(mappingJSON) != "null" {
+			var mapping map[string]any
+			if err := json.Unmarshal(mappingJSON, &mapping); err != nil {
+				return fmt.Errorf("decode account %d model mapping: %w", id, err)
+			}
+			credentials["model_mapping"] = mapping
+		}
+		if modelMappingSupportsRequestedModelForAccount(platform, accountType, credentials, model) {
+			found[id] = struct{}{}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, id := range accountIDs {
+		if _, ok := found[id]; !ok {
+			return fmt.Errorf("%w: account %d does not exist or is not mapped to model %q", ErrInvalidBoard, id, model)
+		}
+	}
+	return nil
 }
 
 func (d *DB) GetAccountStates(ctx context.Context, boardID int64) (map[int64]AccountState, error) {
@@ -296,17 +452,156 @@ FROM lane_account_states WHERE board_id=$1`, boardID)
 type LaneBoardMonitor struct {
 	db     *DB
 	client *Sub2APIClient
-	rdb    *RedisClient
-	mu     sync.Mutex
+
+	configMu   sync.Mutex
+	scheduleMu sync.RWMutex
+	locksMu    sync.Mutex
+	boardLocks map[int64]*sync.Mutex
+
 	// 上次打开账号调度开关的时间（防抖：sub2api 自动关闭=上游真实失败信号，短时间不重开）
 	schedOpenAt map[int64]time.Time
-	// schedOpenAt 专用锁：ensureSchedulable 可能在 m.mu 已持有（ProbeLoop/releaseVerify 链）时被调用，
-	// 用独立锁避免 sync.Mutex 不可重入造成的死锁（2026-08-13 实测：ProbeLoop 卡死 6 小时）
-	schedMu sync.Mutex
+	schedMu     sync.Mutex
+	loopsWG     sync.WaitGroup
 }
 
-func NewLaneBoardMonitor(db *DB, client *Sub2APIClient, rdb *RedisClient) *LaneBoardMonitor {
-	return &LaneBoardMonitor{db: db, client: client, rdb: rdb, schedOpenAt: make(map[int64]time.Time)}
+func NewLaneBoardMonitor(db *DB, client *Sub2APIClient) *LaneBoardMonitor {
+	return &LaneBoardMonitor{
+		db:          db,
+		client:      client,
+		boardLocks:  make(map[int64]*sync.Mutex),
+		schedOpenAt: make(map[int64]time.Time),
+	}
+}
+
+func (m *LaneBoardMonitor) lockForBoard(boardID int64) *sync.Mutex {
+	m.locksMu.Lock()
+	defer m.locksMu.Unlock()
+	lock := m.boardLocks[boardID]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		m.boardLocks[boardID] = lock
+	}
+	return lock
+}
+
+func (m *LaneBoardMonitor) executeBoardCleanup(ctx context.Context, ops []BoardCleanupOp) error {
+	seen := make(map[int64]struct{}, len(ops))
+	for _, op := range ops {
+		if _, exists := seen[op.AccountID]; exists {
+			continue
+		}
+		seen[op.AccountID] = struct{}{}
+		cleared, err := m.client.ClearAllOwnedModelRateLimits(ctx, op.AccountID, op.BoardName)
+		if err != nil {
+			if errors.Is(err, ErrSub2APIAccountNotFound) {
+				log.Printf("[laneboard] board=%s account=%d no longer exists in Sub2API; skip cleanup", op.BoardName, op.AccountID)
+				continue
+			}
+			return fmt.Errorf("clear board %q account %d model limits: %w", op.BoardName, op.AccountID, err)
+		}
+		if cleared > 0 {
+			m.db.LogLaneEvent(ctx, op.BoardName, op.Model, op.AccountID, "release", "配置变更，清理泳道图拥有的模型限制")
+		}
+	}
+	return nil
+}
+
+// SaveBoard serializes configuration changes with monitor cycles. Remote
+// cleanup is confirmed before the previous configuration is replaced.
+func (m *LaneBoardMonitor) SaveBoard(ctx context.Context, board *LaneBoard) error {
+	m.configMu.Lock()
+	defer m.configMu.Unlock()
+	m.scheduleMu.Lock()
+	defer m.scheduleMu.Unlock()
+	if board == nil {
+		return fmt.Errorf("board is required")
+	}
+	isNew := board.ID == 0
+	if !isNew {
+		lock := m.lockForBoard(board.ID)
+		lock.Lock()
+		defer lock.Unlock()
+	}
+
+	existing, err := m.db.ListBoards(ctx)
+	if err != nil {
+		return err
+	}
+	if err := validateBoardDefinition(board, existing); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidBoard, err)
+	}
+	if err := m.db.ValidateBoardAccounts(ctx, board.Model, uniqueBoardAccountIDs(board)); err != nil {
+		return err
+	}
+
+	var previous *LaneBoard
+	if board.ID != 0 {
+		previous, err = m.db.GetBoard(ctx, board.ID)
+		if err != nil {
+			return err
+		}
+	}
+	if err := m.executeBoardCleanup(ctx, planBoardCleanup(previous, board)); err != nil {
+		if previous != nil && previous.Enabled {
+			if _, reconcileErr := m.reconcileBoard(ctx, previous); reconcileErr != nil {
+				log.Printf("[laneboard] board=%s restore after cleanup failure: %v", previous.Name, reconcileErr)
+			}
+		}
+		return err
+	}
+	if err := m.db.SaveBoard(ctx, board); err != nil {
+		if previous != nil && previous.Enabled {
+			if _, reconcileErr := m.reconcileBoard(ctx, previous); reconcileErr != nil {
+				log.Printf("[laneboard] board=%s restore after cleanup failure: %v", previous.Name, reconcileErr)
+			}
+		}
+		return err
+	}
+	if isNew {
+		lock := m.lockForBoard(board.ID)
+		lock.Lock()
+		defer lock.Unlock()
+	}
+	if board.Enabled {
+		if _, err := m.reconcileBoard(ctx, board); err != nil {
+			return fmt.Errorf("board saved but initial reconcile failed: %w", err)
+		}
+	}
+	return nil
+}
+
+// DeleteBoard removes every board-owned model limit before deleting the only
+// durable description of that ownership.
+func (m *LaneBoardMonitor) DeleteBoard(ctx context.Context, boardID int64) error {
+	m.configMu.Lock()
+	defer m.configMu.Unlock()
+	m.scheduleMu.Lock()
+	defer m.scheduleMu.Unlock()
+	lock := m.lockForBoard(boardID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	board, err := m.db.GetBoard(ctx, boardID)
+	if err != nil {
+		return err
+	}
+	if err := m.executeBoardCleanup(ctx, planBoardCleanup(board, nil)); err != nil {
+		if board.Enabled {
+			if _, reconcileErr := m.reconcileBoard(ctx, board); reconcileErr != nil {
+				log.Printf("[laneboard] board=%s restore after cleanup failure: %v", board.Name, reconcileErr)
+			}
+		}
+		return err
+	}
+	if err := m.db.DeleteBoard(ctx, boardID); err != nil {
+		if board.Enabled {
+			if _, reconcileErr := m.reconcileBoard(ctx, board); reconcileErr != nil {
+				log.Printf("[laneboard] board=%s restore after cleanup failure: %v", board.Name, reconcileErr)
+			}
+		}
+		return err
+	}
+	return nil
 }
 
 // Start 启动两个循环：
@@ -314,7 +609,9 @@ func NewLaneBoardMonitor(db *DB, client *Sub2APIClient, rdb *RedisClient) *LaneB
 //   - 探测：30s 周期（默认 probe_interval）
 func (m *LaneBoardMonitor) Start(ctx context.Context) {
 	log.Printf("[laneboard] monitor started (error_check=5s, probe=30s)")
+	m.loopsWG.Add(2)
 	go func() {
+		defer m.loopsWG.Done()
 		t := time.NewTicker(5 * time.Second)
 		defer t.Stop()
 		for {
@@ -327,6 +624,7 @@ func (m *LaneBoardMonitor) Start(ctx context.Context) {
 		}
 	}()
 	go func() {
+		defer m.loopsWG.Done()
 		t := time.NewTicker(30 * time.Second)
 		defer t.Stop()
 		for {
@@ -340,28 +638,70 @@ func (m *LaneBoardMonitor) Start(ctx context.Context) {
 	}()
 }
 
+func (m *LaneBoardMonitor) Wait() {
+	m.loopsWG.Wait()
+}
+
+func (m *LaneBoardMonitor) runEnabledBoards(ctx context.Context, boards []LaneBoard, run func(context.Context, *LaneBoard)) {
+	m.scheduleMu.RLock()
+	defer m.scheduleMu.RUnlock()
+	const maxParallelBoards = 4
+	semaphore := make(chan struct{}, maxParallelBoards)
+	var wait sync.WaitGroup
+	for i := range boards {
+		if !boards[i].Enabled {
+			continue
+		}
+		board := boards[i]
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			select {
+			case semaphore <- struct{}{}:
+				defer func() { <-semaphore }()
+			case <-ctx.Done():
+				return
+			}
+			lock := m.lockForBoard(board.ID)
+			lock.Lock()
+			defer lock.Unlock()
+			current, err := m.db.GetBoard(ctx, board.ID)
+			if err != nil {
+				if errors.Is(err, ErrBoardNotFound) {
+					return
+				}
+				log.Printf("[laneboard] reload board=%d: %v", board.ID, err)
+				return
+			}
+			if !current.Enabled {
+				return
+			}
+			run(ctx, current)
+		}()
+	}
+	wait.Wait()
+}
+
 // CheckErrors 每 5s 统计每个图×账号最近 1 分钟窗口内失败数，超过阈值 → 限流
 // 只统计当前 active 泳道及更高优先级（position <= activeIdx）的账号；
 // 更低泳道（备用/压制态）不接流量，不统计。
 func (m *LaneBoardMonitor) CheckErrors(ctx context.Context) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	boards, err := m.db.ListBoards(ctx)
 	if err != nil {
 		log.Printf("[laneboard] list boards: %v", err)
 		return
 	}
-	for _, b := range boards {
-		if !b.Enabled {
-			continue
-		}
-		m.checkBoardErrors(ctx, &b)
-	}
+	m.runEnabledBoards(ctx, boards, func(ctx context.Context, board *LaneBoard) {
+		m.checkBoardErrors(ctx, board)
+	})
 }
 
 func (m *LaneBoardMonitor) checkBoardErrors(ctx context.Context, b *LaneBoard) {
-	// 先做分层压制 reconcile（active 泳道变化也在此驱动），拿到 activeIdx
-	activeIdx := m.reconcileBoard(ctx, b)
+	activeIdx, err := m.reconcileBoard(ctx, b)
+	if err != nil {
+		log.Printf("[laneboard] board=%s reconcile before failure check: %v", b.Name, err)
+		return
+	}
 	// 收集该图所有账号 ID
 	var ids []int64
 	for _, l := range b.Lanes {
@@ -398,52 +738,102 @@ func (m *LaneBoardMonitor) checkBoardErrors(ctx context.Context, b *LaneBoard) {
 			// 只有 active 泳道的 healthy 账号才做失败判定；suppressed/disabled 跳过
 			// （外部抑制已在 reconcileBoard 统一转为 disabled）
 			if st.State == LaneStateHealthy && failCounts[aid] >= b.FailThreshold {
-				m.disableAccount(ctx, b, aid, st)
-			} else {
-				_ = m.db.UpdateAccountStateCheck(ctx, b.ID, aid, st.FailCount, now)
+				if err := m.disableAccount(ctx, b, aid, st); err != nil {
+					log.Printf("[laneboard] board=%s account=%d disable: %v", b.Name, aid, err)
+				}
+			} else if err := m.db.UpdateAccountStateCheck(ctx, b.ID, aid, st.FailCount, now); err != nil {
+				log.Printf("[laneboard] board=%s account=%d update check: %v", b.Name, aid, err)
 			}
 		}
 	}
 }
 
 // externallyDisable 因 sub2api 外部抑制而禁用（不写泳道图条目——原生条目已在挡，避免覆盖）
-func (m *LaneBoardMonitor) externallyDisable(ctx context.Context, b *LaneBoard, aid int64, st AccountState, reason string) {
+func (m *LaneBoardMonitor) externallyDisable(ctx context.Context, b *LaneBoard, aid int64, reason string) error {
 	now := time.Now()
-	_ = m.db.SetAccountState(ctx, b.ID, aid, LaneStateDisabled, &now)
+	if err := m.db.SetAccountState(ctx, b.ID, aid, LaneStateDisabled, &now); err != nil {
+		return err
+	}
 	m.db.LogLaneEvent(ctx, b.Name, b.Model, aid, "disable", "sub2api 外部抑制: "+reason+"，标记禁用等待恢复")
 	log.Printf("[laneboard] board=%s account=%d externally blocked (%s) -> disabled", b.Name, aid, reason)
+	return nil
 }
 
 // reconcileBoard 严格分层：找到第一个存在 healthy 账号的泳道（active），
-// 压制所有更低泳道的 healthy 账号；active 泳道内的 suppressed 账号释放
-func (m *LaneBoardMonitor) reconcileBoard(ctx context.Context, b *LaneBoard) int {
+// 压制更低泳道，并在验证通过之前保留候选账号原有的阻断条目。
+func (m *LaneBoardMonitor) reconcileBoard(ctx context.Context, b *LaneBoard) (int, error) {
 	states, err := m.db.GetAccountStates(ctx, b.ID)
 	if err != nil {
-		log.Printf("[laneboard] board=%s reconcile states: %v", b.Name, err)
-		return -1
+		return -1, err
 	}
 	now := time.Now()
-	// 统一处理外部抑制：healthy 但被 sub2api 原生机制（503冷却/临时禁调度）挡住 → 立即 disabled
-	// 任何入口（check/probe/manual）都走这里，保证状态一致，不会误判 active
-	extBlocks, _ := m.db.GetExternalBlocks(ctx, boardAccountIDs(b), b.Model)
+	extBlocks, err := m.db.GetExternalBlocks(ctx, boardAccountIDs(b), b.Model, b.Name)
+	if err != nil {
+		return -1, fmt.Errorf("query external blocks: %w", err)
+	}
+
+	// Missing or unknown local state is fail-closed. It must never be treated as
+	// healthy, otherwise Sub2API may continue routing around the state table.
+	for _, aid := range uniqueBoardAccountIDs(b) {
+		st, ok := states[aid]
+		if ok && validLaneAccountState(st.State) {
+			continue
+		}
+		if err := m.db.SetAccountState(ctx, b.ID, aid, LaneStateDisabled, &now); err != nil {
+			return -1, fmt.Errorf("initialize account %d state: %w", aid, err)
+		}
+		states[aid] = AccountState{BoardID: b.ID, AccountID: aid, State: LaneStateDisabled, DisabledAt: &now}
+	}
+
+	// Sub2API 原生阻塞优先；只有状态落库成功后才改变本地视图。
 	for i := range b.Lanes {
 		for _, aid := range b.Lanes[i].AccountIDs {
 			st, ok := states[aid]
 			if !ok || st.State != LaneStateHealthy {
 				continue
 			}
-			if extBlocks[aid].blocked(now) {
-				m.externallyDisable(ctx, b, aid, st, extBlocks[aid].blockedReason(now))
+			block := extBlocks[aid]
+			if block.OwnedModelLimit {
+				if err := m.db.SetAccountState(ctx, b.ID, aid, LaneStateDisabled, &now); err != nil {
+					return -1, fmt.Errorf("mark account %d locally blocked: %w", aid, err)
+				}
 				st.State = LaneStateDisabled
+				st.DisabledAt = &now
 				states[aid] = st
+				log.Printf("[laneboard] board=%s account=%d local healthy but owned remote limit remains; fail closed", b.Name, aid)
+				continue
+			}
+			if !block.blocked(now) {
+				continue
+			}
+			if err := m.externallyDisable(ctx, b, aid, block.blockedReason(now)); err != nil {
+				return -1, fmt.Errorf("mark account %d externally disabled: %w", aid, err)
+			}
+			st.State = LaneStateDisabled
+			states[aid] = st
+		}
+	}
+
+	// A disabled local state must also have a real remote blocker once native
+	// cooldowns expire. This also retries earlier failed control writes.
+	for i := range b.Lanes {
+		for _, aid := range b.Lanes[i].AccountIDs {
+			st, ok := states[aid]
+			if !ok || st.State != LaneStateDisabled || extBlocks[aid].blocked(now) {
+				continue
+			}
+			if err := m.ensureDisabledAccount(ctx, b, aid); err != nil {
+				if errors.Is(err, ErrForeignModelRateLimit) {
+					continue
+				}
+				return -1, fmt.Errorf("ensure account %d disabled: %w", aid, err)
 			}
 		}
 	}
-	// 找 active 泳道（第一个存在 healthy 账号的；被外部抑制的已转 disabled 不算）
+
 	activeIdx := -1
 	for i := range b.Lanes {
-		l := &b.Lanes[i]
-		for _, aid := range l.AccountIDs {
+		for _, aid := range b.Lanes[i].AccountIDs {
 			if st, ok := states[aid]; ok && st.State == LaneStateHealthy {
 				activeIdx = i
 				break
@@ -453,36 +843,20 @@ func (m *LaneBoardMonitor) reconcileBoard(ctx context.Context, b *LaneBoard) int
 			break
 		}
 	}
-	// 没有 active 泳道（全部 disabled/suppressed）：释放所有 suppressed，等待探测恢复决定
+
+	// No healthy lane: recover only the first candidate lane that succeeds.
+	// Lower lanes must stay suppressed once a higher lane comes back.
 	if activeIdx == -1 {
 		for i := range b.Lanes {
 			for _, aid := range b.Lanes[i].AccountIDs {
-				st, ok := states[aid]
-				if !ok || st.State != LaneStateSuppressed {
-					continue
+				if st, ok := states[aid]; ok && st.State == LaneStateSuppressed && m.releaseVerify(ctx, b, aid, st, now) {
+					return i, nil
 				}
-				deleted, err := m.db.ClearSuppressIfOwned(ctx, aid, b.Model)
-				if err != nil {
-					log.Printf("[laneboard] board=%s account=%d release sql: %v", b.Name, aid, err)
-					continue
-				}
-				if deleted {
-					m.db.LogLaneEvent(ctx, b.Name, b.Model, aid, "release", "全部泳道不可用，恢复 "+b.Model+" 调度等待探测")
-					log.Printf("[laneboard] board=%s account=%d released (no active lane)", b.Name, aid)
-				} else {
-					// 本地没有抑制条目记录（可能是 API 方式写入的），直接用 API 清一次确保干净
-					if err := m.client.ClearModelRateLimit(ctx, aid, b.Model); err != nil {
-						log.Printf("[laneboard] board=%s account=%d release api: %v", b.Name, aid, err)
-					}
-				}
-				// 切换验证：真实调用一次；失败 → 写限流条目禁用，等定时探测恢复
-				m.releaseVerify(ctx, b, aid, st, now)
 			}
 		}
-		return -1
+		return -1, nil
 	}
-	// 压制 active 之后所有泳道的 healthy/suppressed 账号（disabled 保持，等待探测恢复）
-	// 注意：状态为 suppressed 但条目缺失（历史 bug 或手动清过）也要补写 —— 幂等 ensure
+
 	for i := activeIdx + 1; i < len(b.Lanes); i++ {
 		for _, aid := range b.Lanes[i].AccountIDs {
 			st, ok := states[aid]
@@ -490,88 +864,80 @@ func (m *LaneBoardMonitor) reconcileBoard(ctx context.Context, b *LaneBoard) int
 				continue
 			}
 			if st.State == LaneStateHealthy {
-				m.suppressAccount(ctx, b, aid)
-				_ = m.db.SetAccountState(ctx, b.ID, aid, LaneStateSuppressed, &now)
+				if err := m.suppressAccount(ctx, b, aid); err != nil {
+					log.Printf("[laneboard] board=%s account=%d suppress: %v", b.Name, aid, err)
+					continue
+				}
+				if err := m.db.SetAccountState(ctx, b.ID, aid, LaneStateSuppressed, &now); err != nil {
+					return -1, fmt.Errorf("persist account %d suppression: %w", aid, err)
+				}
 				continue
 			}
-			// state 已是 suppressed：确认抑制条目存在，缺失则补写
-			has, err := m.db.HasSuppressEntry(ctx, aid, b.Model)
-			if err != nil {
-				log.Printf("[laneboard] board=%s account=%d has-suppress: %v", b.Name, aid, err)
-				continue
-			}
-			if !has {
-				m.suppressAccount(ctx, b, aid)
-				log.Printf("[laneboard] board=%s account=%d re-suppressed (entry was missing)", b.Name, aid)
+			if err := m.ensureSuppressedAccount(ctx, b, aid); err != nil {
+				log.Printf("[laneboard] board=%s account=%d ensure suppression: %v", b.Name, aid, err)
 			}
 		}
 	}
-	// 释放 active 泳道及更高泳道（position <= activeIdx）内的 suppressed 账号：
-	//   - active 泳道内 suppressed：上层全挂后本泳道成为 active 的情形，必须释放并验证
-	//   - 更高泳道 suppressed：历史残留（该泳道已无 healthy 但 suppressed 未清），
-	//     释放+验证成功 → healthy → active 升回更高泳道（期望的恢复）
-	// 必须走 releaseVerify 验证调用：直接置 healthy 会产生未验证的假 healthy
+
+	// Recover stale suppressed accounts in the active lane or higher. If a
+	// higher lane recovers, do not release any lower lane from this snapshot.
 	for i := 0; i <= activeIdx; i++ {
 		for _, aid := range b.Lanes[i].AccountIDs {
-			st, ok := states[aid]
-			if !ok || st.State != LaneStateSuppressed {
-				continue
-			}
-			deleted, err := m.db.ClearSuppressIfOwned(ctx, aid, b.Model)
-			if err != nil {
-				log.Printf("[laneboard] board=%s account=%d release sql: %v", b.Name, aid, err)
-				continue
-			}
-			if deleted {
-				m.db.LogLaneEvent(ctx, b.Name, b.Model, aid, "release", "高泳道不可用，恢复 "+b.Model+" 调度")
-				log.Printf("[laneboard] board=%s account=%d suppression released", b.Name, aid)
-			} else {
-				// 本地无抑制条目记录，直接用 API 清一次确保干净
-				if err := m.client.ClearModelRateLimit(ctx, aid, b.Model); err != nil {
-					log.Printf("[laneboard] board=%s account=%d release api: %v", b.Name, aid, err)
+			if st, ok := states[aid]; ok && st.State == LaneStateSuppressed {
+				if m.releaseVerify(ctx, b, aid, st, now) && i < activeIdx {
+					return i, nil
 				}
 			}
-			m.releaseVerify(ctx, b, aid, st, now)
 		}
 	}
-	return activeIdx
+	return activeIdx, nil
 }
 
-// suppressAccount 压制：通过 sub2api 管理 API 写抑制条目（reason lane_board:suppressed:<board>）
-func (m *LaneBoardMonitor) suppressAccount(ctx context.Context, b *LaneBoard, aid int64) {
-	entry := map[string]any{
-		"reason":              laneSuppressPrefix + b.Name,
+func boardLimitEntry(reason string) map[string]any {
+	return map[string]any{
+		"reason":              reason,
 		"rate_limited_at":     time.Now().UTC().Format(time.RFC3339),
 		"rate_limit_reset_at": laneFarFuture,
 	}
-	if err := m.client.SetModelRateLimit(ctx, aid, b.Model, entry); err != nil {
-		log.Printf("[laneboard] board=%s account=%d suppress api: %v", b.Name, aid, err)
-		return
+}
+
+func (m *LaneBoardMonitor) ensureDisabledAccount(ctx context.Context, b *LaneBoard, aid int64) error {
+	return m.client.SetOwnedModelRateLimit(ctx, aid, b.Model, b.Name, boardLimitEntry(laneReasonPrefix+b.Name))
+}
+
+func (m *LaneBoardMonitor) ensureSuppressedAccount(ctx context.Context, b *LaneBoard, aid int64) error {
+	return m.client.SetOwnedModelRateLimit(ctx, aid, b.Model, b.Name, boardLimitEntry(laneSuppressPrefix+b.Name))
+}
+
+// suppressAccount writes the remote blocker first; callers persist local state
+// only after this method succeeds.
+func (m *LaneBoardMonitor) suppressAccount(ctx context.Context, b *LaneBoard, aid int64) error {
+	if err := m.ensureSuppressedAccount(ctx, b, aid); err != nil {
+		return err
 	}
 	m.db.LogLaneEvent(ctx, b.Name, b.Model, aid, "suppress", "高泳道可用，暂停 "+b.Model+" 调度")
 	log.Printf("[laneboard] board=%s account=%d suppressed", b.Name, aid)
+	return nil
 }
 
 // ProbeLoop 探测所有 disabled 账号；泳道全挂 → 下一泳道立即探测
 func (m *LaneBoardMonitor) ProbeLoop(ctx context.Context) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	boards, err := m.db.ListBoards(ctx)
 	if err != nil {
 		log.Printf("[laneboard] list boards: %v", err)
 		return
 	}
-	for _, b := range boards {
-		if !b.Enabled {
-			continue
-		}
-		m.probeBoard(ctx, &b)
-	}
+	m.runEnabledBoards(ctx, boards, func(ctx context.Context, board *LaneBoard) {
+		m.probeBoard(ctx, board)
+	})
 }
 
 func (m *LaneBoardMonitor) probeBoard(ctx context.Context, b *LaneBoard) {
-	// 先 reconcile：active 泳道变化、外部抑制、释放（全挂释放 / 候选恢复）都在这里处理
-	activeIdx := m.reconcileBoard(ctx, b)
+	activeIdx, err := m.reconcileBoard(ctx, b)
+	if err != nil {
+		log.Printf("[laneboard] board=%s reconcile before probe: %v", b.Name, err)
+		return
+	}
 	states, err := m.db.GetAccountStates(ctx, b.ID)
 	if err != nil {
 		log.Printf("[laneboard] board=%s states: %v", b.Name, err)
@@ -579,8 +945,12 @@ func (m *LaneBoardMonitor) probeBoard(ctx context.Context, b *LaneBoard) {
 	}
 	interval := time.Duration(b.ProbeInterval) * time.Second
 	now := time.Now()
-	// 外部抑制（sub2api 原生冷却/临时禁调度）：探测恢复前要跳过
-	extBlocks, _ := m.db.GetExternalBlocks(ctx, boardAccountIDs(b), b.Model)
+	// 外部阻塞读取失败时不探测、不改变任何状态。
+	extBlocks, err := m.db.GetExternalBlocks(ctx, boardAccountIDs(b), b.Model, b.Name)
+	if err != nil {
+		log.Printf("[laneboard] board=%s external blocks before probe: %v", b.Name, err)
+		return
+	}
 	// 探测集合 = active 泳道及以上（position <= activeIdx）的 disabled 账号：
 	//   - active 泳道内挂掉的账号（真实流量失败判定后禁用）必须探测恢复
 	//   - 更高泳道的 disabled 是潜在接管候选，也要探测（恢复 = 流量回到更高优先级）
@@ -599,30 +969,33 @@ func (m *LaneBoardMonitor) probeBoard(ctx context.Context, b *LaneBoard) {
 			eb := extBlocks[aid]
 			// 原生冷却/临时禁调度中的账号跳过（冷却中探测无意义，过期后自然恢复探测）；
 			// 但仅"账号调度开关关闭"的不跳过——泳道图验证成功就要重新打开开关（否则永远无法恢复）
-			if eb.blocked(now) && !(eb.Status == "active" && eb.NativeCoolUntil == nil && eb.TempUnschedUntil == nil) {
+			if !externalBlockAllowsProbe(eb, now) {
 				continue
 			}
 			if st.LastProbeAt != nil && now.Sub(*st.LastProbeAt) < interval {
 				continue
 			}
-			m.probeAccount(ctx, b, aid, st, now)
+			if m.probeAccount(ctx, b, aid, st, now) {
+				if _, err := m.reconcileBoard(ctx, b); err != nil {
+					log.Printf("[laneboard] board=%s reconcile after recovery: %v", b.Name, err)
+				}
+				return
+			}
 		}
 	}
 }
 
-// boardAccountIDs 收集泳道图所有账号 ID
+// boardAccountIDs 收集并去重泳道图所有账号 ID
 func boardAccountIDs(b *LaneBoard) []int64 {
-	var out []int64
-	for _, l := range b.Lanes {
-		out = append(out, l.AccountIDs...)
-	}
-	return out
+	return uniqueBoardAccountIDs(b)
 }
 
 // checkErrorsGate 恢复前置门槛（用户规则 2026-08-17）：
 // 探测恢复必须 CheckErrors 与 ProbeLoop 同时通过——
-//   CheckErrors 通过 = 账号在 WindowSeconds 窗口内失败数 < fail_threshold
-//   ProbeLoop 通过  = /test 探测调用成功
+//
+//	CheckErrors 通过 = 账号在 WindowSeconds 窗口内失败数 < fail_threshold
+//	ProbeLoop 通过  = /test 探测调用成功
+//
 // CheckErrors 未通过 = 真实流量仍在窗口内失败超阈值，恢复后立刻又会被禁用（乒乓根因），禁止恢复。
 // 返回 (是否通过, 窗口失败数, 错误)
 func (m *LaneBoardMonitor) checkErrorsGate(ctx context.Context, b *LaneBoard, aid int64) (bool, int, error) {
@@ -635,63 +1008,66 @@ func (m *LaneBoardMonitor) checkErrorsGate(ctx context.Context, b *LaneBoard, ai
 	return n < b.FailThreshold, n, nil
 }
 
-// probeAccount 用图模型真实探测账号；成功且无外部抑制 → 恢复调度
-func (m *LaneBoardMonitor) probeAccount(ctx context.Context, b *LaneBoard, aid int64, st AccountState, now time.Time) {
+// probeAccount keeps the remote blocker in place until both the traffic gate and
+// the real probe pass. TestAccountModel restores Sub2API's automatic cleanup.
+func (m *LaneBoardMonitor) updateProbeState(ctx context.Context, boardID, accountID int64, ok bool, msg string, at time.Time) {
+	if err := m.db.UpdateAccountStateProbe(ctx, boardID, accountID, ok, msg, at); err != nil {
+		log.Printf("[laneboard] board=%d account=%d update probe state: %v", boardID, accountID, err)
+	}
+}
+
+func (m *LaneBoardMonitor) probeAccount(ctx context.Context, b *LaneBoard, aid int64, st AccountState, now time.Time) bool {
+	gatePass, n, gateErr := m.checkErrorsGate(ctx, b, aid)
+	if gateErr != nil {
+		msg := "CheckErrors 检查失败，暂不探测: " + gateErr.Error()
+		m.updateProbeState(ctx, b.ID, aid, false, msg, now)
+		log.Printf("[laneboard] board=%s account=%d %s", b.Name, aid, msg)
+		return false
+	}
+	if !gatePass {
+		msg := fmt.Sprintf("%d秒窗口内%d次失败≥阈值%d，CheckErrors未通过不探测", b.WindowSeconds, n, b.FailThreshold)
+		m.updateProbeState(ctx, b.ID, aid, false, msg, now)
+		return false
+	}
+
 	ok, msg, err := m.client.TestAccountModel(ctx, aid, b.Model)
 	if err != nil {
 		msg = err.Error()
 		ok = false
 	}
-	// 恢复前置门槛（用户规则）：CheckErrors 与 ProbeLoop 同时通过
-	// 探测成功但窗口内失败数仍 ≥ 阈值 → 不恢复（真实流量还在失败）
-	if ok {
-		gatePass, n, gerr := m.checkErrorsGate(ctx, b, aid)
-		if gerr != nil {
-			log.Printf("[laneboard] board=%s account=%d check-errors gate: %v", b.Name, aid, gerr)
-			_ = m.db.UpdateAccountStateProbe(ctx, b.ID, aid, ok, "CheckErrors 检查失败，暂不恢复", now)
-			return
-		}
-		if !gatePass {
-			gmsg := fmt.Sprintf("探测成功但%d秒窗口内%d次失败≥阈值%d，CheckErrors未通过不恢复", b.WindowSeconds, n, b.FailThreshold)
-			_ = m.db.UpdateAccountStateProbe(ctx, b.ID, aid, ok, gmsg, now)
-			// 无条目则补写禁用（防止 sub2api 照常路由一个正在失败中的账号）
-			m.disableAccount(ctx, b, aid, st)
-			log.Printf("[laneboard] board=%s account=%d probe ok but %s", b.Name, aid, gmsg)
-			return
-		}
+	if err := m.db.UpdateAccountStateProbe(ctx, b.ID, aid, ok, msg, now); err != nil {
+		log.Printf("[laneboard] board=%s account=%d update probe: %v", b.Name, aid, err)
 	}
-	// 探测成功但被 sub2api 外部抑制挡住 → 不能恢复（避免 探测成功→恢复→又禁用 循环）
-	// 但账号开关关闭的：泳道图验证通过 → 重新打开（否则永远无法恢复）
-	if ok {
-		canSched, reason := m.ensureSchedulable(ctx, b, aid)
-		if !canSched {
-			_ = m.db.UpdateAccountStateProbe(ctx, b.ID, aid, ok, "探测成功但"+reason, now)
-			log.Printf("[laneboard] board=%s account=%d probe ok but %s, stay disabled", b.Name, aid, reason)
-			return
+	if !ok {
+		newFail, failErr := m.db.IncProbeFail(ctx, b.ID, aid, now)
+		if failErr != nil {
+			log.Printf("[laneboard] board=%s account=%d increment probe failure: %v", b.Name, aid, failErr)
+			return false
 		}
+		st.FailCount = newFail
+		if err := m.disableAccount(ctx, b, aid, st); err != nil {
+			log.Printf("[laneboard] board=%s account=%d keep disabled after probe failure: %v", b.Name, aid, err)
+			return false
+		}
+		log.Printf("[laneboard] board=%s account=%d probe failed: %s", b.Name, aid, msg)
+		return false
 	}
-	// 更新探测状态
-	_ = m.db.UpdateAccountStateProbe(ctx, b.ID, aid, ok, msg, now)
-	if ok {
-		_ = m.db.ResetProbeFail(ctx, b.ID, aid, now)
-		log.Printf("[laneboard] board=%s account=%d recovered", b.Name, aid)
-		m.enableAccount(ctx, b, aid, st)
-	} else {
-		newFail, ferr := m.db.IncProbeFail(ctx, b.ID, aid, now)
-		if ferr != nil {
-			log.Printf("[laneboard] board=%s account=%d inc fail: %v", b.Name, aid, ferr)
-			return
-		}
-		if newFail >= b.FailThreshold {
-			// 连续探测失败达阈值 → 写条目禁用（sub2api 停止路由），等后续探测恢复
-			// disabled 且无条目的账号（reconcile 转的）探测失败同样要写条目，否则 sub2api 照常路由
-			st.FailCount = newFail
-			m.disableAccount(ctx, b, aid, st)
-			log.Printf("[laneboard] board=%s account=%d probe fail x%d -> disabled w/ entry", b.Name, aid, newFail)
-		} else {
-			log.Printf("[laneboard] board=%s account=%d probe fail: %s", b.Name, aid, msg)
-		}
+
+	canSched, reason := m.ensureSchedulable(ctx, b, aid)
+	if !canSched {
+		m.updateProbeState(ctx, b.ID, aid, true, "探测成功但"+reason, now)
+		log.Printf("[laneboard] board=%s account=%d probe ok but %s, stay disabled", b.Name, aid, reason)
+		return false
 	}
+	if err := m.enableAccount(ctx, b, aid); err != nil {
+		log.Printf("[laneboard] board=%s account=%d enable after probe: %v", b.Name, aid, err)
+		return false
+	}
+	if err := m.db.ResetProbeFail(ctx, b.ID, aid, now); err != nil {
+		log.Printf("[laneboard] board=%s account=%d reset probe failures: %v", b.Name, aid, err)
+	}
+	log.Printf("[laneboard] board=%s account=%d recovered", b.Name, aid)
+	return true
 }
 
 // disableAccount 禁用：写 model_rate_limits（无活跃自动条目时）+ 清缓存
@@ -701,7 +1077,7 @@ func (m *LaneBoardMonitor) probeAccount(ctx context.Context, b *LaneBoard, aid i
 // 若有原生冷却/临时禁调度/状态异常则不动（那些机制在管，不该强制覆盖）。
 // 返回 (最终是否可调度, 阻塞原因)
 func (m *LaneBoardMonitor) ensureSchedulable(ctx context.Context, b *LaneBoard, aid int64) (bool, string) {
-	blocks, err := m.db.GetExternalBlocks(ctx, []int64{aid}, b.Model)
+	blocks, err := m.db.GetExternalBlocks(ctx, []int64{aid}, b.Model, b.Name)
 	if err != nil {
 		return false, "查询外部抑制失败: " + err.Error()
 	}
@@ -710,7 +1086,7 @@ func (m *LaneBoardMonitor) ensureSchedulable(ctx context.Context, b *LaneBoard, 
 		return true, ""
 	}
 	// 仅因账号开关关闭（其余维度都正常）→ 重新打开（带防抖）
-	if !eb.Schedulable && eb.Status == "active" && eb.NativeCoolUntil == nil && eb.TempUnschedUntil == nil {
+	if !eb.Schedulable && eb.Status == "active" && !eb.Expired && !eb.QuotaExceeded && eb.NativeCoolUntil == nil && eb.RateLimitUntil == nil && eb.OverloadUntil == nil && eb.TempUnschedUntil == nil {
 		m.schedMu.Lock()
 		lastOpen, opened := m.schedOpenAt[aid]
 		m.schedMu.Unlock()
@@ -727,7 +1103,7 @@ func (m *LaneBoardMonitor) ensureSchedulable(ctx context.Context, b *LaneBoard, 
 		m.db.LogLaneEvent(ctx, b.Name, b.Model, aid, "enable", "验证调用成功，重新打开账号调度开关")
 		log.Printf("[laneboard] board=%s account=%d re-enabled schedulable", b.Name, aid)
 		// 重查确认
-		blocks2, err2 := m.db.GetExternalBlocks(ctx, []int64{aid}, b.Model)
+		blocks2, err2 := m.db.GetExternalBlocks(ctx, []int64{aid}, b.Model, b.Name)
 		if err2 == nil && !blocks2[aid].blocked(time.Now()) {
 			return true, ""
 		}
@@ -736,109 +1112,219 @@ func (m *LaneBoardMonitor) ensureSchedulable(ctx context.Context, b *LaneBoard, 
 	return false, eb.blockedReason(time.Now())
 }
 
-// releaseVerify 泳道切换后的验证调用：对释放的账号真实调用一次
-//   - 成功且无外部抑制 → healthy（sub2api 正常调度）
-//   - 成功但外部抑制（账号开关关闭/原生冷却等）→ disabled（不写条目，原生机制已在挡）
-//   - 失败 → 写 lane_board failed 条目真正禁用（sub2api 停止路由），等定时探测恢复
-func (m *LaneBoardMonitor) releaseVerify(ctx context.Context, b *LaneBoard, aid int64, st AccountState, now time.Time) {
+// releaseVerify validates a suppressed candidate without removing its blocker.
+// The owned entry is cleared only after the traffic gate, probe, and external
+// schedulability checks all pass.
+func (m *LaneBoardMonitor) releaseVerify(ctx context.Context, b *LaneBoard, aid int64, st AccountState, now time.Time) bool {
+	interval := time.Duration(b.ProbeInterval) * time.Second
+	if st.LastProbeAt != nil && now.Sub(*st.LastProbeAt) < interval {
+		return false
+	}
+	blocks, err := m.db.GetExternalBlocks(ctx, []int64{aid}, b.Model, b.Name)
+	if err != nil {
+		msg := "释放前外部状态检查失败，保持压制: " + err.Error()
+		m.updateProbeState(ctx, b.ID, aid, false, msg, now)
+		return false
+	}
+	if block := blocks[aid]; !externalBlockAllowsProbe(block, now) {
+		msg := "外部阻塞仍生效，保持压制: " + block.blockedReason(now)
+		m.updateProbeState(ctx, b.ID, aid, false, msg, now)
+		return false
+	}
+
+	gatePass, n, gateErr := m.checkErrorsGate(ctx, b, aid)
+	if gateErr != nil {
+		msg := "释放前 CheckErrors 检查失败，保持压制: " + gateErr.Error()
+		m.updateProbeState(ctx, b.ID, aid, false, msg, now)
+		log.Printf("[laneboard] board=%s account=%d %s", b.Name, aid, msg)
+		return false
+	}
+	if !gatePass {
+		msg := fmt.Sprintf("释放前%d秒窗口内%d次失败≥阈值%d，保持压制", b.WindowSeconds, n, b.FailThreshold)
+		m.updateProbeState(ctx, b.ID, aid, false, msg, now)
+		return false
+	}
+
 	ok, msg, err := m.client.TestAccountModel(ctx, aid, b.Model)
 	if err != nil {
 		msg = err.Error()
 		ok = false
 	}
-	_ = m.db.UpdateAccountStateProbe(ctx, b.ID, aid, ok, msg, now)
-	if ok {
-		// 恢复前置门槛（用户规则）：CheckErrors 与 ProbeLoop 同时通过
-		// 验证调用成功但窗口内失败数仍 ≥ 阈值 → 不恢复（真实流量还在失败）
-		gatePass, n, gerr := m.checkErrorsGate(ctx, b, aid)
-		if gerr != nil {
-			_ = m.db.SetAccountState(ctx, b.ID, aid, LaneStateDisabled, &now)
-			m.db.LogLaneEvent(ctx, b.Name, b.Model, aid, "disable", "释放后验证成功但 CheckErrors 检查失败，保持禁用")
-			log.Printf("[laneboard] board=%s account=%d released, check-errors gate err: %v", b.Name, aid, gerr)
-			return
-		}
-		if !gatePass {
-			// 补写禁用条目（无则写）：suppress 条目已删，防止 sub2api 照常路由一个正在失败中的账号
-			m.disableAccount(ctx, b, aid, st)
-			gmsg := fmt.Sprintf("释放后验证成功但%d秒窗口内%d次失败≥阈值%d，CheckErrors未通过不恢复", b.WindowSeconds, n, b.FailThreshold)
-			m.db.LogLaneEvent(ctx, b.Name, b.Model, aid, "disable", gmsg)
-			log.Printf("[laneboard] board=%s account=%d released, probe ok but %s", b.Name, aid, gmsg)
-			return
-		}
-		// 验证成功：确保账号级调度开关打开（sub2api 自动关闭的要重新打开）
-		canSched, reason := m.ensureSchedulable(ctx, b, aid)
-		if !canSched {
-			_ = m.db.SetAccountState(ctx, b.ID, aid, LaneStateDisabled, &now)
-			m.db.LogLaneEvent(ctx, b.Name, b.Model, aid, "disable", "释放后验证调用成功但"+reason)
-			log.Printf("[laneboard] board=%s account=%d released, probe ok but %s, disabled", b.Name, aid, reason)
-			return
-		}
-		_ = m.db.SetAccountState(ctx, b.ID, aid, LaneStateHealthy, nil)
-		log.Printf("[laneboard] board=%s account=%d released+probe ok, healthy", b.Name, aid)
-		return
+	if err := m.db.UpdateAccountStateProbe(ctx, b.ID, aid, ok, msg, now); err != nil {
+		log.Printf("[laneboard] board=%s account=%d update release probe: %v", b.Name, aid, err)
 	}
-	// 验证调用失败：通过管理 API 写限流条目真正禁用（sub2api 才会停止路由），等定时探测恢复
-	entry := map[string]any{
-		"reason":              laneReasonPrefix + b.Name,
-		"rate_limited_at":     time.Now().UTC().Format(time.RFC3339),
-		"rate_limit_reset_at": laneFarFuture,
+	if !ok {
+		if newFail, failErr := m.db.IncProbeFail(ctx, b.ID, aid, now); failErr == nil {
+			st.FailCount = newFail
+		} else {
+			log.Printf("[laneboard] board=%s account=%d increment release probe failure: %v", b.Name, aid, failErr)
+		}
+		if err := m.disableAccount(ctx, b, aid, st); err != nil {
+			log.Printf("[laneboard] board=%s account=%d disable failed candidate: %v", b.Name, aid, err)
+			return false
+		}
+		m.db.LogLaneEvent(ctx, b.Name, b.Model, aid, "disable", "候选泳道验证失败: "+msg)
+		return false
 	}
-	if err := m.client.SetModelRateLimit(ctx, aid, b.Model, entry); err != nil {
-		log.Printf("[laneboard] board=%s account=%d release-verify disable api: %v", b.Name, aid, err)
+
+	canSched, reason := m.ensureSchedulable(ctx, b, aid)
+	if !canSched {
+		if err := m.db.SetAccountState(ctx, b.ID, aid, LaneStateDisabled, &now); err != nil {
+			log.Printf("[laneboard] board=%s account=%d persist external disable: %v", b.Name, aid, err)
+			return false
+		}
+		m.db.LogLaneEvent(ctx, b.Name, b.Model, aid, "disable", "候选探测成功但"+reason)
+		return false
 	}
-	_ = m.db.SetAccountState(ctx, b.ID, aid, LaneStateDisabled, &now)
-	m.db.LogLaneEvent(ctx, b.Name, b.Model, aid, "disable", "释放后验证调用失败: "+msg)
-	log.Printf("[laneboard] board=%s account=%d released but probe fail (%s), disabled w/ entry", b.Name, aid, msg)
+
+	cleared, err := m.client.ClearAllOwnedModelRateLimits(ctx, aid, b.Name)
+	if err != nil {
+		log.Printf("[laneboard] board=%s account=%d clear verified suppression: %v", b.Name, aid, err)
+		return false
+	}
+	if cleared == 0 {
+		log.Printf("[laneboard] board=%s account=%d verified release had no owned limit", b.Name, aid)
+	}
+	if err := m.confirmAccountSchedulable(ctx, b, aid); err != nil {
+		if reblockErr := m.ensureSuppressedAccount(ctx, b, aid); reblockErr != nil && !errors.Is(reblockErr, ErrForeignModelRateLimit) {
+			log.Printf("[laneboard] board=%s account=%d reblock after confirmation failure: %v", b.Name, aid, reblockErr)
+		}
+		if stateErr := m.db.SetAccountState(ctx, b.ID, aid, LaneStateDisabled, &now); stateErr != nil {
+			log.Printf("[laneboard] board=%s account=%d persist blocked recovery: %v", b.Name, aid, stateErr)
+		}
+		log.Printf("[laneboard] board=%s account=%d verified release remains blocked: %v", b.Name, aid, err)
+		return false
+	}
+	if err := m.db.SetAccountState(ctx, b.ID, aid, LaneStateHealthy, nil); err != nil {
+		if reblockErr := m.ensureSuppressedAccount(ctx, b, aid); reblockErr != nil && !errors.Is(reblockErr, ErrForeignModelRateLimit) {
+			log.Printf("[laneboard] board=%s account=%d reblock after state persistence failure: %v", b.Name, aid, reblockErr)
+		}
+		log.Printf("[laneboard] board=%s account=%d persist verified recovery: %v", b.Name, aid, err)
+		return false
+	}
+	if err := m.db.ResetProbeFail(ctx, b.ID, aid, now); err != nil {
+		log.Printf("[laneboard] board=%s account=%d reset probe failures: %v", b.Name, aid, err)
+	}
+	m.db.LogLaneEvent(ctx, b.Name, b.Model, aid, "release", "验证通过，恢复 "+b.Model+" 调度")
+	log.Printf("[laneboard] board=%s account=%d verified and released", b.Name, aid)
+	return true
 }
 
-func (m *LaneBoardMonitor) disableAccount(ctx context.Context, b *LaneBoard, aid int64, st AccountState) {
-	entry := map[string]any{
-		"reason":              laneReasonPrefix + b.Name,
-		"rate_limited_at":     time.Now().UTC().Format(time.RFC3339),
-		"rate_limit_reset_at": laneFarFuture, // 2099：官方 UI 可见（UI 只渲染未来 reset_at）+ 永不过期不被自动清
-	}
-	// 通过管理 API 写条目（内部自动刷新调度快照）
-	if err := m.client.SetModelRateLimit(ctx, aid, b.Model, entry); err != nil {
-		log.Printf("[laneboard] board=%s account=%d disable api: %v", b.Name, aid, err)
+func (m *LaneBoardMonitor) disableAccount(ctx context.Context, b *LaneBoard, aid int64, st AccountState) error {
+	if err := m.ensureDisabledAccount(ctx, b, aid); err != nil {
+		return err
 	}
 	now := time.Now()
-	_ = m.db.SetAccountState(ctx, b.ID, aid, LaneStateDisabled, &now)
+	if err := m.db.SetAccountState(ctx, b.ID, aid, LaneStateDisabled, &now); err != nil {
+		return err
+	}
 	m.db.LogLaneEvent(ctx, b.Name, b.Model, aid, "disable", fmt.Sprintf("%ds内%d次失败≥阈值%d，关闭%s调度", b.WindowSeconds, st.FailCount, b.FailThreshold, b.Model))
 	log.Printf("[laneboard] board=%s account=%d disabled (%d fails/%ds)", b.Name, aid, st.FailCount, b.WindowSeconds)
+	return nil
 }
 
-// enableAccount 恢复：通过管理 API 删除自己的 model_rate_limits 条目（自动刷新快照）
-func (m *LaneBoardMonitor) enableAccount(ctx context.Context, b *LaneBoard, aid int64, st AccountState) {
-	if err := m.client.ClearModelRateLimit(ctx, aid, b.Model); err != nil {
-		log.Printf("[laneboard] board=%s account=%d enable api: %v", b.Name, aid, err)
+func (m *LaneBoardMonitor) confirmAccountSchedulable(ctx context.Context, b *LaneBoard, aid int64) error {
+	blocks, err := m.db.GetExternalBlocks(ctx, []int64{aid}, b.Model, b.Name)
+	if err != nil {
+		return err
 	}
-	_ = m.db.SetAccountState(ctx, b.ID, aid, LaneStateHealthy, nil)
+	block, ok := blocks[aid]
+	if !ok {
+		return fmt.Errorf("account %d was not found", aid)
+	}
+	if block.OwnedModelLimit {
+		return fmt.Errorf("account still has a board-owned model limit")
+	}
+	if block.blocked(time.Now()) {
+		return fmt.Errorf("account remains externally blocked: %s", block.blockedReason(time.Now()))
+	}
+	return nil
+}
+
+func (m *LaneBoardMonitor) enableAccount(ctx context.Context, b *LaneBoard, aid int64) error {
+	if _, err := m.client.ClearAllOwnedModelRateLimits(ctx, aid, b.Name); err != nil {
+		return err
+	}
+	if err := m.confirmAccountSchedulable(ctx, b, aid); err != nil {
+		if reblockErr := m.ensureDisabledAccount(ctx, b, aid); reblockErr != nil && !errors.Is(reblockErr, ErrForeignModelRateLimit) {
+			log.Printf("[laneboard] board=%s account=%d reblock after enable confirmation failure: %v", b.Name, aid, reblockErr)
+		}
+		return err
+	}
+	if err := m.db.SetAccountState(ctx, b.ID, aid, LaneStateHealthy, nil); err != nil {
+		if reblockErr := m.ensureDisabledAccount(ctx, b, aid); reblockErr != nil && !errors.Is(reblockErr, ErrForeignModelRateLimit) {
+			log.Printf("[laneboard] board=%s account=%d reblock after enable state failure: %v", b.Name, aid, reblockErr)
+		}
+		return err
+	}
 	m.db.LogLaneEvent(ctx, b.Name, b.Model, aid, "enable", "探测成功，恢复 "+b.Model+" 调度")
 	log.Printf("[laneboard] board=%s account=%d enabled", b.Name, aid)
+	return nil
 }
 
-// ManualProbe 手动探测（UI 用）
+// ManualProbe serializes with monitor cycles and validates board ownership.
 func (m *LaneBoardMonitor) ManualProbe(ctx context.Context, boardID, accountID int64) (bool, string, error) {
+	lock := m.lockForBoard(boardID)
+	lock.Lock()
+	defer lock.Unlock()
+
 	b, err := m.db.GetBoard(ctx, boardID)
 	if err != nil {
 		return false, "", err
 	}
-	ok, msg, err := m.client.TestAccountModel(ctx, accountID, b.Model)
-	now := time.Now()
-	_ = m.db.UpdateAccountStateProbe(ctx, boardID, accountID, ok, msg, now)
-	if ok {
-		// 恢复前置门槛（用户规则）：CheckErrors 与 ProbeLoop 同时通过
-		gatePass, n, gerr := m.checkErrorsGate(ctx, b, accountID)
-		if gerr != nil {
-			return false, "CheckErrors 检查失败: " + gerr.Error(), gerr
-		}
-		if !gatePass {
-			return false, fmt.Sprintf("探测成功但%d秒窗口内%d次失败≥阈值%d，CheckErrors未通过不恢复", b.WindowSeconds, n, b.FailThreshold), nil
-		}
-		m.enableAccount(ctx, b, accountID, AccountState{})
-		m.reconcileBoard(ctx, b)
+	if !b.Enabled {
+		return false, "", fmt.Errorf("%w: board %q is disabled", ErrInvalidBoard, b.Name)
 	}
-	return ok, msg, err
-}
+	belongs := false
+	for _, id := range boardAccountIDs(b) {
+		if id == accountID {
+			belongs = true
+			break
+		}
+	}
+	if !belongs {
+		return false, "", fmt.Errorf("%w: account %d does not belong to board %q", ErrInvalidBoard, accountID, b.Name)
+	}
 
-var _ = strings.TrimSpace
+	now := time.Now()
+	blocks, err := m.db.GetExternalBlocks(ctx, []int64{accountID}, b.Model, b.Name)
+	if err != nil {
+		return false, "外部状态检查失败: " + err.Error(), err
+	}
+	if block := blocks[accountID]; !externalBlockAllowsProbe(block, now) {
+		return false, "外部阻塞仍生效: " + block.blockedReason(now), nil
+	}
+
+	gatePass, n, err := m.checkErrorsGate(ctx, b, accountID)
+	if err != nil {
+		return false, "CheckErrors 检查失败: " + err.Error(), err
+	}
+	if !gatePass {
+		msg := fmt.Sprintf("%d秒窗口内%d次失败≥阈值%d，CheckErrors未通过不探测", b.WindowSeconds, n, b.FailThreshold)
+		m.updateProbeState(ctx, boardID, accountID, false, msg, now)
+		return false, msg, nil
+	}
+
+	ok, msg, err := m.client.TestAccountModel(ctx, accountID, b.Model)
+	if err != nil {
+		msg = err.Error()
+		ok = false
+	}
+	if updateErr := m.db.UpdateAccountStateProbe(ctx, boardID, accountID, ok, msg, now); updateErr != nil {
+		return false, msg, updateErr
+	}
+	if !ok {
+		return false, msg, err
+	}
+	canSched, reason := m.ensureSchedulable(ctx, b, accountID)
+	if !canSched {
+		return false, "探测成功但" + reason, nil
+	}
+	if err := m.enableAccount(ctx, b, accountID); err != nil {
+		return false, "探测成功但恢复调度失败: " + err.Error(), err
+	}
+	if _, err := m.reconcileBoard(ctx, b); err != nil {
+		return false, "探测成功但泳道重排失败: " + err.Error(), err
+	}
+	return true, msg, nil
+}

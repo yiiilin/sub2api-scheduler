@@ -23,6 +23,7 @@ func NewAuth(baseURL string) *Auth {
 
 // ValidateToken 调 sub2api /api/v1/auth/me 验证 token，返回是否管理员
 func (a *Auth) ValidateToken(token string) (bool, error) {
+	token = strings.TrimSpace(token)
 	if token == "" {
 		return false, nil
 	}

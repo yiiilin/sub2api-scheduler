@@ -4,8 +4,10 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -25,7 +27,7 @@ type Server struct {
 }
 
 func NewServer(db *DB, cfg *Config, auth *Auth, laneMonitor *LaneBoardMonitor) *Server {
-	sub := NewSub2APIClient(cfg.Sub2API.BaseURL, cfg.Sub2API.AdminAPIKey)
+	sub := NewSub2APIClient(cfg.Sub2API.BaseURL, cfg.Sub2API.AdminAPIKey, db)
 	return &Server{db: db, cfg: cfg, auth: auth, laneMonitor: laneMonitor, sub: sub}
 }
 
@@ -50,10 +52,12 @@ func (s *Server) Routes() http.Handler {
 // withAuth 校验 iframe token（sub2api 会话）
 func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		token := r.URL.Query().Get("token")
+		token := ""
+		if authorization := strings.TrimSpace(r.Header.Get("Authorization")); strings.HasPrefix(authorization, "Bearer ") {
+			token = strings.TrimSpace(strings.TrimPrefix(authorization, "Bearer "))
+		}
 		if token == "" {
-			token = r.Header.Get("Authorization")
-			token = strings.TrimPrefix(token, "Bearer ")
+			token = r.URL.Query().Get("token") // compatibility with older iframe URLs
 		}
 		isAdmin, err := s.auth.ValidateToken(token)
 		if err != nil {
@@ -98,10 +102,10 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{
-		"history": hist,
-		"count":   len(hist),
-		"total":   total,
-		"page":    page,
+		"history":   hist,
+		"count":     len(hist),
+		"total":     total,
+		"page":      page,
 		"page_size": pageSize,
 	})
 }
@@ -110,22 +114,48 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 
 // BoardAccountView 泳道图里账号的展示视图
 type BoardAccountView struct {
-	ID              int64        `json:"id"`
-	Name            string       `json:"name"`
-	Priority        int          `json:"priority"`
-	Schedulable     bool         `json:"schedulable"`
-	Status          string       `json:"status"`
-	HasModelMapping bool         `json:"has_model_mapping"`
-	ModelDisabled   bool         `json:"model_disabled"` // model_rate_limits 里有该模型（禁用/限流）
-	ModelLimitInfo  *string      `json:"model_limit_info"`
-	State           string       `json:"state"` // healthy / disabled / suppressed
-	DisabledAt      *string      `json:"disabled_at"`
-	LastProbeAt     *string      `json:"last_probe_at"`
-	LastProbeOK     *bool        `json:"last_probe_ok"`
-	LastProbeMsg    string       `json:"last_probe_msg"`
-	FailCount       int          `json:"fail_count"`
-	CheckedAt       *string      `json:"checked_at"`
-	LastSuccessAt   *string      `json:"last_success_at"` // 最近实际调用成功（usage_logs）
+	ID              int64   `json:"id"`
+	Name            string  `json:"name"`
+	Priority        int     `json:"priority"`
+	Schedulable     bool    `json:"schedulable"`
+	Status          string  `json:"status"`
+	HasModelMapping bool    `json:"has_model_mapping"`
+	ModelDisabled   bool    `json:"model_disabled"` // model_rate_limits 里有该模型（禁用/限流）
+	ModelLimitInfo  *string `json:"model_limit_info"`
+	State           string  `json:"state"` // healthy / disabled / suppressed
+	DisabledAt      *string `json:"disabled_at"`
+	LastProbeAt     *string `json:"last_probe_at"`
+	LastProbeOK     *bool   `json:"last_probe_ok"`
+	LastProbeMsg    string  `json:"last_probe_msg"`
+	FailCount       int     `json:"fail_count"`
+	CheckedAt       *string `json:"checked_at"`
+	LastSuccessAt   *string `json:"last_success_at"` // 最近实际调用成功（usage_logs）
+}
+
+func boardMutationStatus(err error) int {
+	if errors.Is(err, ErrBoardNotFound) {
+		return http.StatusNotFound
+	}
+	if errors.Is(err, ErrInvalidBoard) {
+		return http.StatusBadRequest
+	}
+	return http.StatusInternalServerError
+}
+
+func decodeBoardJSON(w http.ResponseWriter, r *http.Request, board *LaneBoard) error {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(board); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("request body must contain a single JSON object")
+		}
+		return err
+	}
+	return nil
 }
 
 // GET /api/boards — 泳道图列表（含泳道、账号实时状态）
@@ -155,7 +185,7 @@ func (s *Server) handleBoards(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"boards": out, "count": len(out)})
 	case http.MethodPost:
 		var b LaneBoard
-		if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
+		if err := decodeBoardJSON(w, r, &b); err != nil {
 			writeJSON(w, 400, map[string]any{"error": "invalid json: " + err.Error()})
 			return
 		}
@@ -163,8 +193,8 @@ func (s *Server) handleBoards(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 400, map[string]any{"error": "name and model required"})
 			return
 		}
-		if err := s.db.SaveBoard(ctx, &b); err != nil {
-			writeJSON(w, 500, map[string]any{"error": err.Error()})
+		if err := s.laneMonitor.SaveBoard(ctx, &b); err != nil {
+			writeJSON(w, boardMutationStatus(err), map[string]any{"error": err.Error()})
 			return
 		}
 		writeJSON(w, 200, map[string]any{"board": b})
@@ -183,11 +213,15 @@ func (s *Server) handleBoardCandidates(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 	rows, err := s.db.pool.Query(ctx, `
-SELECT id, name, priority, schedulable, status
+SELECT id, name, platform, type, priority, schedulable, status,
+       credentials->'model_mapping',
+       COALESCE(credentials->>'oauth_type', ''),
+       COALESCE(credentials->>'project_id', ''),
+       COALESCE((extra->>'openai_passthrough') = 'true', false),
+       COALESCE((extra->>'openai_oauth_passthrough') = 'true', false)
 FROM accounts
 WHERE deleted_at IS NULL
-  AND credentials->'model_mapping' ? $1
-ORDER BY priority ASC, id ASC`, model)
+ORDER BY priority ASC, id ASC`)
 	if err != nil {
 		writeJSON(w, 500, map[string]any{"error": err.Error()})
 		return
@@ -196,6 +230,8 @@ ORDER BY priority ASC, id ASC`, model)
 	type cand struct {
 		ID          int64  `json:"id"`
 		Name        string `json:"name"`
+		Platform    string `json:"-"`
+		Type        string `json:"-"`
 		Priority    int    `json:"priority"`
 		Schedulable bool   `json:"schedulable"`
 		Status      string `json:"status"`
@@ -203,11 +239,34 @@ ORDER BY priority ASC, id ASC`, model)
 	var out []cand
 	for rows.Next() {
 		var c cand
-		if err := rows.Scan(&c.ID, &c.Name, &c.Priority, &c.Schedulable, &c.Status); err != nil {
+		var mappingJSON []byte
+		var oauthType, projectID string
+		var passThrough, oauthPassThrough bool
+		if err := rows.Scan(&c.ID, &c.Name, &c.Platform, &c.Type, &c.Priority, &c.Schedulable, &c.Status, &mappingJSON, &oauthType, &projectID, &passThrough, &oauthPassThrough); err != nil {
 			writeJSON(w, 500, map[string]any{"error": err.Error()})
 			return
 		}
-		out = append(out, c)
+		credentials := map[string]any{
+			"oauth_type":               oauthType,
+			"project_id":               projectID,
+			"openai_passthrough":       passThrough,
+			"openai_oauth_passthrough": oauthPassThrough,
+		}
+		if len(mappingJSON) > 0 && string(mappingJSON) != "null" {
+			var mapping map[string]any
+			if err := json.Unmarshal(mappingJSON, &mapping); err != nil {
+				writeJSON(w, 500, map[string]any{"error": "decode account model mapping: " + err.Error()})
+				return
+			}
+			credentials["model_mapping"] = mapping
+		}
+		if modelMappingSupportsRequestedModelForAccount(c.Platform, c.Type, credentials, model) {
+			out = append(out, c)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		writeJSON(w, 500, map[string]any{"error": err.Error()})
+		return
 	}
 	writeJSON(w, 200, map[string]any{"accounts": out, "count": len(out)})
 }
@@ -238,7 +297,7 @@ func (s *Server) handleBoardDetail(w http.ResponseWriter, r *http.Request) {
 		}
 		ok, msg, err := s.laneMonitor.ManualProbe(ctx, id, accID)
 		if err != nil {
-			writeJSON(w, 500, map[string]any{"error": err.Error()})
+			writeJSON(w, boardMutationStatus(err), map[string]any{"error": err.Error()})
 			return
 		}
 		writeJSON(w, 200, map[string]any{"healthy": ok, "message": msg})
@@ -248,19 +307,19 @@ func (s *Server) handleBoardDetail(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPut:
 		var b LaneBoard
-		if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
-			writeJSON(w, 400, map[string]any{"error": "invalid json"})
+		if err := decodeBoardJSON(w, r, &b); err != nil {
+			writeJSON(w, 400, map[string]any{"error": "invalid json: " + err.Error()})
 			return
 		}
 		b.ID = id
-		if err := s.db.SaveBoard(ctx, &b); err != nil {
-			writeJSON(w, 500, map[string]any{"error": err.Error()})
+		if err := s.laneMonitor.SaveBoard(ctx, &b); err != nil {
+			writeJSON(w, boardMutationStatus(err), map[string]any{"error": err.Error()})
 			return
 		}
 		writeJSON(w, 200, map[string]any{"board": b})
 	case http.MethodDelete:
-		if err := s.db.DeleteBoard(ctx, id); err != nil {
-			writeJSON(w, 500, map[string]any{"error": err.Error()})
+		if err := s.laneMonitor.DeleteBoard(ctx, id); err != nil {
+			writeJSON(w, boardMutationStatus(err), map[string]any{"error": err.Error()})
 			return
 		}
 		writeJSON(w, 200, map[string]any{"ok": true})
@@ -293,13 +352,21 @@ func (s *Server) boardView(ctx context.Context, b LaneBoard, accMap map[int64]Su
 			}
 			if sa, ok := accMap[aid]; ok {
 				if raw, ok := sa.Extra["model_rate_limits"].(map[string]any); ok {
-					if entry, ok := raw[b.Model]; ok {
+					for _, modelKey := range accountModelRateLimitKeys(&sa, b.Model) {
+						entry, exists := raw[modelKey]
+						if !exists {
+							continue
+						}
+						if !activeModelRateLimit(entry, time.Now()) {
+							continue
+						}
 						v.ModelDisabled = true
 						if s2, ok := entry.(map[string]any); ok {
 							if reason, ok := s2["reason"].(string); ok {
 								v.ModelLimitInfo = &reason
 							}
 						}
+						break
 					}
 				}
 			}
@@ -362,9 +429,5 @@ func (s *Server) boardView(ctx context.Context, b LaneBoard, accMap map[int64]Su
 
 // boardAllAccountIDs 收集泳道图所有账号 ID
 func boardAllAccountIDs(b LaneBoard) []int64 {
-	var out []int64
-	for _, l := range b.Lanes {
-		out = append(out, l.AccountIDs...)
-	}
-	return out
+	return uniqueBoardAccountIDs(&b)
 }
