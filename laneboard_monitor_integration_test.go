@@ -787,4 +787,43 @@ VALUES (1, 'qa-model', 'upstream', 503), (1, 'qa-model', 'upstream', 503)`)
 		requireOwnedModelLimit(t, db, board, 2, false)
 		requireOwnedModelLimit(t, db, board, 3, true)
 	})
+
+	t.Run("lower all-down lane is never probed while higher lane is active", func(t *testing.T) {
+		resetMonitorScenario(t, db, fake)
+		board := createMonitorBoard(t, db, monitor, []int64{1}, []int64{3})
+		if err := monitor.disableAccount(context.Background(), board, 3, AccountState{FailCount: 3}); err != nil {
+			t.Fatalf("fail the lower lane: %v", err)
+		}
+		// 即使上次探测时间早已超过间隔，也不允许探测被压制的低泳道
+		if _, err := db.pool.Exec(context.Background(), `
+UPDATE lane_account_states SET last_probe_at=now() - interval '2 minutes', last_probe_ok=false
+WHERE board_id=$1 AND account_id=3`, board.ID); err != nil {
+			t.Fatalf("age lower-lane probe timestamp: %v", err)
+		}
+
+		monitor.probeBoard(context.Background(), board)
+		monitor.probeBoard(context.Background(), board)
+
+		requireAccountStates(t, db, board.ID, map[int64]string{1: LaneStateHealthy, 3: LaneStateDisabled})
+		requireOwnedModelLimit(t, db, board, 3, true)
+		if fake.calls(3) != 0 {
+			t.Fatalf("lower all-down lane was probed while higher lane was active: calls=%d", fake.calls(3))
+		}
+	})
+
+	t.Run("lower suppressed lane is never probed while higher lane is active", func(t *testing.T) {
+		resetMonitorScenario(t, db, fake)
+		board := createMonitorBoard(t, db, monitor, []int64{1}, []int64{3})
+		// createMonitorBoard 的初始 reconcile 会把低泳道 B 压制为 suppressed
+		requireAccountStates(t, db, board.ID, map[int64]string{1: LaneStateHealthy, 3: LaneStateSuppressed})
+
+		monitor.probeBoard(context.Background(), board)
+		monitor.probeBoard(context.Background(), board)
+
+		requireAccountStates(t, db, board.ID, map[int64]string{1: LaneStateHealthy, 3: LaneStateSuppressed})
+		requireOwnedModelLimit(t, db, board, 3, true)
+		if fake.calls(3) != 0 {
+			t.Fatalf("suppressed lower lane was probed while higher lane was active: calls=%d", fake.calls(3))
+		}
+	})
 }
