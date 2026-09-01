@@ -213,6 +213,17 @@ async function loadAll() {
   await Promise.all([loadBoards(), loadHistory()]);
 }
 
+let refreshInFlight = false;
+async function refreshAll() {
+  if (refreshInFlight) return;
+  refreshInFlight = true;
+  try {
+    await loadAll();
+  } finally {
+    refreshInFlight = false;
+  }
+}
+
 async function loadBoards() {
   const d = await j('/boards');
   boards = d.boards || [];
@@ -459,8 +470,8 @@ async function deleteBoard(id) {
   }
 }
 
-loadAll().catch(e => toast('加载失败: ' + e.message));
-setInterval(() => loadAll().catch(() => {}), 30000);
+refreshAll().catch(e => toast('加载失败: ' + e.message));
+setInterval(() => refreshAll().catch(() => {}), 5000);
 </script>
 </body>
 </html>

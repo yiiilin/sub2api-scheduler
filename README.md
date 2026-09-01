@@ -161,8 +161,9 @@ advisory lock and refuses a second instance.
         │   count upstream 5xx/429/err │
         │   in window → disable        │
         │                              │
-        │  ProbeLoop (30s)             │
+        │  Probe scan (every 5s)       │
         │   test disabled accounts     │
+        │   at each board's interval   │
         │   recover only if gate ok    │
         │                              │
         │  reconcile (per cycle)       │
@@ -194,9 +195,11 @@ A disabled account is only brought back when **both** hold:
 
 1. **ProbeLoop passes** — a real `/admin/accounts/:id/test` call succeeds.
 2. **CheckErrors passes** — the account's upstream failures in the last
-   `window_seconds` are below `fail_threshold`.
+   `window_seconds` are below `fail_threshold` both before and after the real probe.
 
-This prevents flapping: an account that is still failing real traffic never gets
+Failover probes the next candidate lane immediately, without the normal
+`probe_interval` throttle; routine recovery still honors that interval. This
+prevents flapping: an account that is still failing real traffic never gets
 re-enabled to immediately trip the circuit again.
 
 ---

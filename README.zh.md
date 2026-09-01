@@ -132,8 +132,8 @@ PostgreSQL（`config.yaml` 里的 DSN）和它的管理 API（`sub2api.base_url`
         │   统计窗口内上游 5xx/429/错误 │
         │   → 超阈值禁用               │
         │                              │
-        │  ProbeLoop (30s)             │
-        │   探测被禁用账号             │
+        │  ProbeLoop（每 5s 扫描）       │
+        │   按图配置间隔探测被禁用账号    │
         │   门槛通过才恢复             │
         │                              │
         │  reconcile (每周期)          │
@@ -164,9 +164,9 @@ PostgreSQL（`config.yaml` 里的 DSN）和它的管理 API（`sub2api.base_url`
 被禁用账号只有在**两个条件同时满足**时才恢复：
 
 1. **ProbeLoop 通过** — 真实 `/admin/accounts/:id/test` 调用成功；
-2. **CheckErrors 通过** — 该账号最近 `window_seconds` 内上游失败数低于 `fail_threshold`。
+2. **CheckErrors 通过** — 该账号最近 `window_seconds` 内上游失败数低于 `fail_threshold`，并且在真实探测完成后复查仍然通过。
 
-这防乒乓：真实流量仍在失败的账号永远不会被重新启用后立刻再次熔断。
+故障接管下一泳道时会立即验证候选账号，不受常规 `probe_interval` 节流；日常恢复仍遵循该间隔。这防乒乓：真实流量仍在失败的账号永远不会被重新启用后立刻再次熔断。
 
 ---
 

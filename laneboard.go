@@ -75,11 +75,13 @@ type AccountState struct {
 }
 
 const (
-	LaneStateHealthy    = "healthy"
-	LaneStateDisabled   = "disabled"
-	LaneStateSuppressed = "suppressed" // 被更高优先级泳道压制（即使健康也不调度）
-	laneReasonPrefix    = "lane_board:"
-	laneSuppressPrefix  = "lane_board:suppressed:"
+	LaneStateHealthy       = "healthy"
+	LaneStateDisabled      = "disabled"
+	LaneStateSuppressed    = "suppressed" // 被更高优先级泳道压制（即使健康也不调度）
+	laneReasonPrefix       = "lane_board:"
+	laneSuppressPrefix     = "lane_board:suppressed:"
+	laneErrorCheckInterval = 5 * time.Second
+	laneProbeScanInterval  = 5 * time.Second
 	// Sub2API 只有在 rate_limit_reset_at 是未来时间时才把模型条目视为有效；
 	// 使用 2099 保持阻断，直到本调度器通过管理 API 精确清理 owner 条目。
 	laneFarFuture = "2099-12-31T23:59:59Z"
@@ -453,6 +455,11 @@ type LaneBoardMonitor struct {
 	db     *DB
 	client *Sub2APIClient
 
+	errorCheckInterval time.Duration
+	probeScanInterval  time.Duration
+	checkErrorsCycle   func(context.Context)
+	probeCycle         func(context.Context)
+
 	configMu   sync.Mutex
 	scheduleMu sync.RWMutex
 	locksMu    sync.Mutex
@@ -465,12 +472,17 @@ type LaneBoardMonitor struct {
 }
 
 func NewLaneBoardMonitor(db *DB, client *Sub2APIClient) *LaneBoardMonitor {
-	return &LaneBoardMonitor{
-		db:          db,
-		client:      client,
-		boardLocks:  make(map[int64]*sync.Mutex),
-		schedOpenAt: make(map[int64]time.Time),
+	monitor := &LaneBoardMonitor{
+		db:                 db,
+		client:             client,
+		errorCheckInterval: laneErrorCheckInterval,
+		probeScanInterval:  laneProbeScanInterval,
+		boardLocks:         make(map[int64]*sync.Mutex),
+		schedOpenAt:        make(map[int64]time.Time),
 	}
+	monitor.checkErrorsCycle = monitor.CheckErrors
+	monitor.probeCycle = monitor.ProbeLoop
+	return monitor
 }
 
 func (m *LaneBoardMonitor) lockForBoard(boardID int64) *sync.Mutex {
@@ -519,7 +531,9 @@ func (m *LaneBoardMonitor) SaveBoard(ctx context.Context, board *LaneBoard) erro
 	isNew := board.ID == 0
 	if !isNew {
 		lock := m.lockForBoard(board.ID)
-		lock.Lock()
+		if !lockWithContext(ctx, lock) {
+			return ctx.Err()
+		}
 		defer lock.Unlock()
 	}
 
@@ -559,7 +573,9 @@ func (m *LaneBoardMonitor) SaveBoard(ctx context.Context, board *LaneBoard) erro
 	}
 	if isNew {
 		lock := m.lockForBoard(board.ID)
-		lock.Lock()
+		if !lockWithContext(ctx, lock) {
+			return ctx.Err()
+		}
 		defer lock.Unlock()
 	}
 	if board.Enabled {
@@ -578,7 +594,9 @@ func (m *LaneBoardMonitor) DeleteBoard(ctx context.Context, boardID int64) error
 	m.scheduleMu.Lock()
 	defer m.scheduleMu.Unlock()
 	lock := m.lockForBoard(boardID)
-	lock.Lock()
+	if !lockWithContext(ctx, lock) {
+		return ctx.Err()
+	}
 	defer lock.Unlock()
 
 	board, err := m.db.GetBoard(ctx, boardID)
@@ -604,42 +622,81 @@ func (m *LaneBoardMonitor) DeleteBoard(ctx context.Context, boardID int64) error
 	return nil
 }
 
+func runMonitorLoop(ctx context.Context, interval time.Duration, cycle func(context.Context)) {
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		cycle(ctx)
+		timer.Reset(interval)
+	}
+}
+
 // Start 启动两个循环：
 //   - 错误统计：5s 周期，统计最近 1 分钟（WindowSeconds）窗口内失败数，超阈值 → 限流
-//   - 探测：30s 周期（默认 probe_interval）
+//   - 探测扫描：5s 周期；单账号仍按所属泳道图的 probe_interval 控制实际探测频率
 func (m *LaneBoardMonitor) Start(ctx context.Context) {
-	log.Printf("[laneboard] monitor started (error_check=5s, probe=30s)")
+	log.Printf("[laneboard] monitor started (error_check=%s, probe_scan=%s)", m.errorCheckInterval, m.probeScanInterval)
 	m.loopsWG.Add(2)
 	go func() {
 		defer m.loopsWG.Done()
-		t := time.NewTicker(5 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				m.CheckErrors(ctx)
-			}
-		}
+		runMonitorLoop(ctx, m.errorCheckInterval, m.checkErrorsCycle)
 	}()
 	go func() {
 		defer m.loopsWG.Done()
-		t := time.NewTicker(30 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				m.ProbeLoop(ctx)
-			}
-		}
+		runMonitorLoop(ctx, m.probeScanInterval, m.probeCycle)
 	}()
 }
 
 func (m *LaneBoardMonitor) Wait() {
 	m.loopsWG.Wait()
+}
+
+func lockWithContext(ctx context.Context, lock sync.Locker) bool {
+	if tryLock, ok := lock.(interface{ TryLock() bool }); ok {
+		for {
+			if tryLock.TryLock() {
+				return true
+			}
+			timer := time.NewTimer(5 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return false
+			case <-timer.C:
+			}
+		}
+	}
+	lock.Lock()
+	if ctx.Err() != nil {
+		lock.Unlock()
+		return false
+	}
+	return true
+}
+
+func runBoardTask(ctx context.Context, semaphore chan struct{}, lock sync.Locker, run func()) bool {
+	if !lockWithContext(ctx, lock) {
+		return false
+	}
+	defer lock.Unlock()
+	select {
+	case semaphore <- struct{}{}:
+		defer func() { <-semaphore }()
+	case <-ctx.Done():
+		return false
+	}
+	run()
+	return true
 }
 
 func (m *LaneBoardMonitor) runEnabledBoards(ctx context.Context, boards []LaneBoard, run func(context.Context, *LaneBoard)) {
@@ -656,27 +713,19 @@ func (m *LaneBoardMonitor) runEnabledBoards(ctx context.Context, boards []LaneBo
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			select {
-			case semaphore <- struct{}{}:
-				defer func() { <-semaphore }()
-			case <-ctx.Done():
-				return
-			}
 			lock := m.lockForBoard(board.ID)
-			lock.Lock()
-			defer lock.Unlock()
-			current, err := m.db.GetBoard(ctx, board.ID)
-			if err != nil {
-				if errors.Is(err, ErrBoardNotFound) {
+			runBoardTask(ctx, semaphore, lock, func() {
+				current, err := m.db.GetBoard(ctx, board.ID)
+				if err != nil {
+					if !errors.Is(err, ErrBoardNotFound) {
+						log.Printf("[laneboard] reload board=%d: %v", board.ID, err)
+					}
 					return
 				}
-				log.Printf("[laneboard] reload board=%d: %v", board.ID, err)
-				return
-			}
-			if !current.Enabled {
-				return
-			}
-			run(ctx, current)
+				if current.Enabled {
+					run(ctx, current)
+				}
+			})
 		}()
 	}
 	wait.Wait()
@@ -722,6 +771,7 @@ func (m *LaneBoardMonitor) checkBoardErrors(ctx context.Context, b *LaneBoard) {
 		return
 	}
 	now := time.Now()
+	stateChanged := false
 	for i, l := range b.Lanes {
 		// 只统计当前 active 泳道及更高优先级（position <= activeIdx）的账号；
 		// 全挂（activeIdx=-1）时无 active 泳道，所有账号都是恢复候选，全部统计
@@ -738,12 +788,20 @@ func (m *LaneBoardMonitor) checkBoardErrors(ctx context.Context, b *LaneBoard) {
 			// 只有 active 泳道的 healthy 账号才做失败判定；suppressed/disabled 跳过
 			// （外部抑制已在 reconcileBoard 统一转为 disabled）
 			if st.State == LaneStateHealthy && failCounts[aid] >= b.FailThreshold {
+				// Reconcile even when the local state write fails: the remote limit
+				// may already have been committed and must be reflected immediately.
+				stateChanged = true
 				if err := m.disableAccount(ctx, b, aid, st); err != nil {
 					log.Printf("[laneboard] board=%s account=%d disable: %v", b.Name, aid, err)
 				}
 			} else if err := m.db.UpdateAccountStateCheck(ctx, b.ID, aid, st.FailCount, now); err != nil {
 				log.Printf("[laneboard] board=%s account=%d update check: %v", b.Name, aid, err)
 			}
+		}
+	}
+	if stateChanged {
+		if _, err := m.reconcileBoardWithOptions(ctx, b, true); err != nil {
+			log.Printf("[laneboard] board=%s reconcile after failure state change: %v", b.Name, err)
 		}
 	}
 }
@@ -762,6 +820,10 @@ func (m *LaneBoardMonitor) externallyDisable(ctx context.Context, b *LaneBoard, 
 // reconcileBoard 严格分层：找到第一个存在 healthy 账号的泳道（active），
 // 压制更低泳道，并在验证通过之前保留候选账号原有的阻断条目。
 func (m *LaneBoardMonitor) reconcileBoard(ctx context.Context, b *LaneBoard) (int, error) {
+	return m.reconcileBoardWithOptions(ctx, b, false)
+}
+
+func (m *LaneBoardMonitor) reconcileBoardWithOptions(ctx context.Context, b *LaneBoard, forceRecovery bool) (int, error) {
 	states, err := m.db.GetAccountStates(ctx, b.ID)
 	if err != nil {
 		return -1, err
@@ -844,14 +906,54 @@ func (m *LaneBoardMonitor) reconcileBoard(ctx context.Context, b *LaneBoard) (in
 		}
 	}
 
-	// No healthy lane: recover only the first candidate lane that succeeds.
-	// Lower lanes must stay suppressed once a higher lane comes back.
+	// No healthy lane: select the first candidate lane with a successful
+	// verification, release every healthy peer in that lane, and leave all
+	// lower-priority lanes suppressed.
 	if activeIdx == -1 {
+		interval := time.Duration(b.ProbeInterval) * time.Second
 		for i := range b.Lanes {
+			recoveredLane := false
+			recoveredAccounts := make(map[int64]AccountState)
 			for _, aid := range b.Lanes[i].AccountIDs {
-				if st, ok := states[aid]; ok && st.State == LaneStateSuppressed && m.releaseVerify(ctx, b, aid, st, now) {
-					return i, nil
+				st, ok := states[aid]
+				if !ok {
+					continue
 				}
+				switch st.State {
+				case LaneStateSuppressed:
+					ok, err := m.releaseVerify(ctx, b, aid, st, forceRecovery)
+					if err != nil {
+						return -1, fmt.Errorf("verify suppressed account %d: %w", aid, err)
+					}
+					if ok {
+						recoveredLane = true
+						recoveredAccounts[aid] = st
+					}
+				case LaneStateDisabled:
+					attemptAt := time.Now()
+					if !probeDue(st.LastProbeAt, interval, attemptAt, forceRecovery) || !externalBlockAllowsProbe(extBlocks[aid], attemptAt) {
+						continue
+					}
+					ok, err := m.probeAccount(ctx, b, aid, st)
+					if err != nil {
+						return -1, fmt.Errorf("probe account %d: %w", aid, err)
+					}
+					if ok {
+						recoveredLane = true
+						recoveredAccounts[aid] = st
+					}
+				}
+			}
+			if recoveredLane {
+				if _, err := m.reconcileBoardWithOptions(ctx, b, false); err != nil {
+					for aid, previous := range recoveredAccounts {
+						if rollbackErr := m.restoreBlockedAccount(ctx, b, aid, previous); rollbackErr != nil {
+							log.Printf("[laneboard] board=%s account=%d rollback all-down recovery: %v", b.Name, aid, rollbackErr)
+						}
+					}
+					return -1, err
+				}
+				return i, nil
 			}
 		}
 		return -1, nil
@@ -865,8 +967,7 @@ func (m *LaneBoardMonitor) reconcileBoard(ctx context.Context, b *LaneBoard) (in
 			}
 			if st.State == LaneStateHealthy {
 				if err := m.suppressAccount(ctx, b, aid); err != nil {
-					log.Printf("[laneboard] board=%s account=%d suppress: %v", b.Name, aid, err)
-					continue
+					return -1, fmt.Errorf("suppress account %d: %w", aid, err)
 				}
 				if err := m.db.SetAccountState(ctx, b.ID, aid, LaneStateSuppressed, &now); err != nil {
 					return -1, fmt.Errorf("persist account %d suppression: %w", aid, err)
@@ -874,20 +975,41 @@ func (m *LaneBoardMonitor) reconcileBoard(ctx context.Context, b *LaneBoard) (in
 				continue
 			}
 			if err := m.ensureSuppressedAccount(ctx, b, aid); err != nil {
-				log.Printf("[laneboard] board=%s account=%d ensure suppression: %v", b.Name, aid, err)
+				return -1, fmt.Errorf("ensure account %d suppressed: %w", aid, err)
 			}
 		}
 	}
 
-	// Recover stale suppressed accounts in the active lane or higher. If a
-	// higher lane recovers, do not release any lower lane from this snapshot.
+	// Recover stale suppressed accounts in the active lane or higher. A higher
+	// recovery changes the active lane, so reconcile again before returning to
+	// suppress the previous active lane in the same cycle.
 	for i := 0; i <= activeIdx; i++ {
+		recoveredLane := false
+		var recoveredAccounts []int64
 		for _, aid := range b.Lanes[i].AccountIDs {
-			if st, ok := states[aid]; ok && st.State == LaneStateSuppressed {
-				if m.releaseVerify(ctx, b, aid, st, now) && i < activeIdx {
-					return i, nil
-				}
+			st, ok := states[aid]
+			if !ok || st.State != LaneStateSuppressed {
+				continue
 			}
+			ok, err := m.releaseVerify(ctx, b, aid, st, false)
+			if err != nil {
+				return -1, fmt.Errorf("verify stale suppressed account %d: %w", aid, err)
+			}
+			if ok {
+				recoveredLane = true
+				recoveredAccounts = append(recoveredAccounts, aid)
+			}
+		}
+		if recoveredLane && i < activeIdx {
+			if _, err := m.reconcileBoard(ctx, b); err != nil {
+				for _, aid := range recoveredAccounts {
+					if rollbackErr := m.restoreBlockedAccount(ctx, b, aid, states[aid]); rollbackErr != nil {
+						log.Printf("[laneboard] board=%s account=%d rollback stale recovery: %v", b.Name, aid, rollbackErr)
+					}
+				}
+				return -1, err
+			}
+			return i, nil
 		}
 	}
 	return activeIdx, nil
@@ -944,7 +1066,6 @@ func (m *LaneBoardMonitor) probeBoard(ctx context.Context, b *LaneBoard) {
 		return
 	}
 	interval := time.Duration(b.ProbeInterval) * time.Second
-	now := time.Now()
 	// 外部阻塞读取失败时不探测、不改变任何状态。
 	extBlocks, err := m.db.GetExternalBlocks(ctx, boardAccountIDs(b), b.Model, b.Name)
 	if err != nil {
@@ -966,18 +1087,27 @@ func (m *LaneBoardMonitor) probeBoard(ctx context.Context, b *LaneBoard) {
 			if !ok || st.State != LaneStateDisabled {
 				continue
 			}
+			now := time.Now()
 			eb := extBlocks[aid]
 			// 原生冷却/临时禁调度中的账号跳过（冷却中探测无意义，过期后自然恢复探测）；
 			// 但仅"账号调度开关关闭"的不跳过——泳道图验证成功就要重新打开开关（否则永远无法恢复）
 			if !externalBlockAllowsProbe(eb, now) {
 				continue
 			}
-			if st.LastProbeAt != nil && now.Sub(*st.LastProbeAt) < interval {
+			if !probeDue(st.LastProbeAt, interval, now, false) {
 				continue
 			}
-			if m.probeAccount(ctx, b, aid, st, now) {
+			ok, probeErr := m.probeAccount(ctx, b, aid, st)
+			if probeErr != nil {
+				log.Printf("[laneboard] board=%s account=%d probe: %v", b.Name, aid, probeErr)
+				return
+			}
+			if ok {
 				if _, err := m.reconcileBoard(ctx, b); err != nil {
 					log.Printf("[laneboard] board=%s reconcile after recovery: %v", b.Name, err)
+					if rollbackErr := m.restoreBlockedAccount(ctx, b, aid, st); rollbackErr != nil {
+						log.Printf("[laneboard] board=%s account=%d rollback failed recovery: %v", b.Name, aid, rollbackErr)
+					}
 				}
 				return
 			}
@@ -988,6 +1118,32 @@ func (m *LaneBoardMonitor) probeBoard(ctx context.Context, b *LaneBoard) {
 // boardAccountIDs 收集并去重泳道图所有账号 ID
 func boardAccountIDs(b *LaneBoard) []int64 {
 	return uniqueBoardAccountIDs(b)
+}
+
+func probeDue(lastProbeAt *time.Time, interval time.Duration, now time.Time, force bool) bool {
+	return force || lastProbeAt == nil || now.Sub(*lastProbeAt) >= interval
+}
+
+func boardAccountLaneIndex(b *LaneBoard, accountID int64) (int, bool) {
+	for laneIndex := range b.Lanes {
+		for _, candidateID := range b.Lanes[laneIndex].AccountIDs {
+			if candidateID == accountID {
+				return laneIndex, true
+			}
+		}
+	}
+	return -1, false
+}
+
+func boardActiveLaneIndex(b *LaneBoard, states map[int64]AccountState) int {
+	for laneIndex := range b.Lanes {
+		for _, accountID := range b.Lanes[laneIndex].AccountIDs {
+			if state, ok := states[accountID]; ok && state.State == LaneStateHealthy {
+				return laneIndex
+			}
+		}
+	}
+	return -1
 }
 
 // checkErrorsGate 恢复前置门槛（用户规则 2026-08-17）：
@@ -1016,58 +1172,80 @@ func (m *LaneBoardMonitor) updateProbeState(ctx context.Context, boardID, accoun
 	}
 }
 
-func (m *LaneBoardMonitor) probeAccount(ctx context.Context, b *LaneBoard, aid int64, st AccountState, now time.Time) bool {
+func (m *LaneBoardMonitor) updateProbeDecision(ctx context.Context, boardID, accountID int64, msg string, at time.Time) {
+	if err := m.db.UpdateAccountStateDecision(ctx, boardID, accountID, msg, at); err != nil {
+		log.Printf("[laneboard] board=%d account=%d update probe decision: %v", boardID, accountID, err)
+	}
+}
+
+func (m *LaneBoardMonitor) probeAccount(ctx context.Context, b *LaneBoard, aid int64, st AccountState) (bool, error) {
+	decisionAt := time.Now()
 	gatePass, n, gateErr := m.checkErrorsGate(ctx, b, aid)
 	if gateErr != nil {
 		msg := "CheckErrors 检查失败，暂不探测: " + gateErr.Error()
-		m.updateProbeState(ctx, b.ID, aid, false, msg, now)
+		m.updateProbeDecision(ctx, b.ID, aid, msg, decisionAt)
 		log.Printf("[laneboard] board=%s account=%d %s", b.Name, aid, msg)
-		return false
+		return false, gateErr
 	}
 	if !gatePass {
 		msg := fmt.Sprintf("%d秒窗口内%d次失败≥阈值%d，CheckErrors未通过不探测", b.WindowSeconds, n, b.FailThreshold)
-		m.updateProbeState(ctx, b.ID, aid, false, msg, now)
-		return false
+		m.updateProbeDecision(ctx, b.ID, aid, msg, decisionAt)
+		return false, nil
 	}
 
-	ok, msg, err := m.client.TestAccountModel(ctx, aid, b.Model)
-	if err != nil {
-		msg = err.Error()
+	ok, msg, probeErr := m.client.TestAccountModel(ctx, aid, b.Model)
+	probeCompletedAt := time.Now()
+	if probeErr != nil {
+		msg = probeErr.Error()
 		ok = false
 	}
-	if err := m.db.UpdateAccountStateProbe(ctx, b.ID, aid, ok, msg, now); err != nil {
-		log.Printf("[laneboard] board=%s account=%d update probe: %v", b.Name, aid, err)
+	if err := m.db.UpdateAccountStateProbe(ctx, b.ID, aid, ok, msg, probeCompletedAt); err != nil {
+		return false, fmt.Errorf("persist probe result: %w", err)
 	}
 	if !ok {
-		newFail, failErr := m.db.IncProbeFail(ctx, b.ID, aid, now)
-		if failErr != nil {
-			log.Printf("[laneboard] board=%s account=%d increment probe failure: %v", b.Name, aid, failErr)
-			return false
+		newFail, err := m.db.IncProbeFail(ctx, b.ID, aid, probeCompletedAt)
+		if err != nil {
+			return false, fmt.Errorf("increment probe failure: %w", err)
 		}
 		st.FailCount = newFail
 		if err := m.disableAccount(ctx, b, aid, st); err != nil {
-			log.Printf("[laneboard] board=%s account=%d keep disabled after probe failure: %v", b.Name, aid, err)
-			return false
+			return false, fmt.Errorf("keep account disabled after probe failure: %w", err)
 		}
 		log.Printf("[laneboard] board=%s account=%d probe failed: %s", b.Name, aid, msg)
-		return false
+		return false, nil
+	}
+
+	gatePass, n, gateErr = m.checkErrorsGate(ctx, b, aid)
+	if gateErr != nil || !gatePass {
+		if gateErr != nil {
+			msg = "探测成功但恢复前 CheckErrors 复查失败: " + gateErr.Error()
+		} else {
+			msg = fmt.Sprintf("探测成功但%d秒窗口内%d次失败≥阈值%d，保持禁用", b.WindowSeconds, n, b.FailThreshold)
+		}
+		m.updateProbeState(ctx, b.ID, aid, true, msg, probeCompletedAt)
+		if err := m.ensureDisabledAccount(ctx, b, aid); err != nil && !errors.Is(err, ErrForeignModelRateLimit) {
+			return false, fmt.Errorf("reblock account after traffic gate changed: %w", err)
+		}
+		if gateErr != nil {
+			return false, gateErr
+		}
+		return false, nil
 	}
 
 	canSched, reason := m.ensureSchedulable(ctx, b, aid)
 	if !canSched {
-		m.updateProbeState(ctx, b.ID, aid, true, "探测成功但"+reason, now)
+		m.updateProbeState(ctx, b.ID, aid, true, "探测成功但"+reason, probeCompletedAt)
 		log.Printf("[laneboard] board=%s account=%d probe ok but %s, stay disabled", b.Name, aid, reason)
-		return false
+		return false, nil
 	}
-	if err := m.enableAccount(ctx, b, aid); err != nil {
-		log.Printf("[laneboard] board=%s account=%d enable after probe: %v", b.Name, aid, err)
-		return false
+	if err := m.enableAccount(ctx, b, aid, st); err != nil {
+		return false, fmt.Errorf("enable account after probe: %w", err)
 	}
-	if err := m.db.ResetProbeFail(ctx, b.ID, aid, now); err != nil {
+	if err := m.db.ResetProbeFail(ctx, b.ID, aid, probeCompletedAt); err != nil {
 		log.Printf("[laneboard] board=%s account=%d reset probe failures: %v", b.Name, aid, err)
 	}
 	log.Printf("[laneboard] board=%s account=%d recovered", b.Name, aid)
-	return true
+	return true, nil
 }
 
 // disableAccount 禁用：写 model_rate_limits（无活跃自动条目时）+ 清缓存
@@ -1115,99 +1293,136 @@ func (m *LaneBoardMonitor) ensureSchedulable(ctx context.Context, b *LaneBoard, 
 // releaseVerify validates a suppressed candidate without removing its blocker.
 // The owned entry is cleared only after the traffic gate, probe, and external
 // schedulability checks all pass.
-func (m *LaneBoardMonitor) releaseVerify(ctx context.Context, b *LaneBoard, aid int64, st AccountState, now time.Time) bool {
+func (m *LaneBoardMonitor) releaseVerify(ctx context.Context, b *LaneBoard, aid int64, st AccountState, force bool) (bool, error) {
+	now := time.Now()
 	interval := time.Duration(b.ProbeInterval) * time.Second
-	if st.LastProbeAt != nil && now.Sub(*st.LastProbeAt) < interval {
-		return false
+	if !probeDue(st.LastProbeAt, interval, now, force) {
+		return false, nil
 	}
 	blocks, err := m.db.GetExternalBlocks(ctx, []int64{aid}, b.Model, b.Name)
 	if err != nil {
 		msg := "释放前外部状态检查失败，保持压制: " + err.Error()
-		m.updateProbeState(ctx, b.ID, aid, false, msg, now)
-		return false
+		m.updateProbeDecision(ctx, b.ID, aid, msg, now)
+		return false, err
 	}
 	if block := blocks[aid]; !externalBlockAllowsProbe(block, now) {
 		msg := "外部阻塞仍生效，保持压制: " + block.blockedReason(now)
-		m.updateProbeState(ctx, b.ID, aid, false, msg, now)
-		return false
+		m.updateProbeDecision(ctx, b.ID, aid, msg, now)
+		return false, nil
 	}
 
 	gatePass, n, gateErr := m.checkErrorsGate(ctx, b, aid)
 	if gateErr != nil {
 		msg := "释放前 CheckErrors 检查失败，保持压制: " + gateErr.Error()
-		m.updateProbeState(ctx, b.ID, aid, false, msg, now)
+		m.updateProbeDecision(ctx, b.ID, aid, msg, now)
 		log.Printf("[laneboard] board=%s account=%d %s", b.Name, aid, msg)
-		return false
+		return false, gateErr
 	}
 	if !gatePass {
 		msg := fmt.Sprintf("释放前%d秒窗口内%d次失败≥阈值%d，保持压制", b.WindowSeconds, n, b.FailThreshold)
-		m.updateProbeState(ctx, b.ID, aid, false, msg, now)
-		return false
+		m.updateProbeDecision(ctx, b.ID, aid, msg, now)
+		return false, nil
 	}
 
-	ok, msg, err := m.client.TestAccountModel(ctx, aid, b.Model)
-	if err != nil {
-		msg = err.Error()
+	ok, msg, probeErr := m.client.TestAccountModel(ctx, aid, b.Model)
+	probeCompletedAt := time.Now()
+	if probeErr != nil {
+		msg = probeErr.Error()
 		ok = false
 	}
-	if err := m.db.UpdateAccountStateProbe(ctx, b.ID, aid, ok, msg, now); err != nil {
-		log.Printf("[laneboard] board=%s account=%d update release probe: %v", b.Name, aid, err)
+	if err := m.db.UpdateAccountStateProbe(ctx, b.ID, aid, ok, msg, probeCompletedAt); err != nil {
+		return false, fmt.Errorf("persist release probe result: %w", err)
 	}
 	if !ok {
-		if newFail, failErr := m.db.IncProbeFail(ctx, b.ID, aid, now); failErr == nil {
-			st.FailCount = newFail
-		} else {
-			log.Printf("[laneboard] board=%s account=%d increment release probe failure: %v", b.Name, aid, failErr)
+		newFail, err := m.db.IncProbeFail(ctx, b.ID, aid, probeCompletedAt)
+		if err != nil {
+			return false, fmt.Errorf("increment release probe failure: %w", err)
 		}
+		st.FailCount = newFail
 		if err := m.disableAccount(ctx, b, aid, st); err != nil {
-			log.Printf("[laneboard] board=%s account=%d disable failed candidate: %v", b.Name, aid, err)
-			return false
+			return false, fmt.Errorf("disable failed candidate: %w", err)
 		}
 		m.db.LogLaneEvent(ctx, b.Name, b.Model, aid, "disable", "候选泳道验证失败: "+msg)
-		return false
+		return false, nil
+	}
+
+	gatePass, n, gateErr = m.checkErrorsGate(ctx, b, aid)
+	if gateErr != nil || !gatePass {
+		if gateErr != nil {
+			msg = "候选探测成功但释放前 CheckErrors 复查失败: " + gateErr.Error()
+		} else {
+			msg = fmt.Sprintf("候选探测成功但%d秒窗口内%d次失败≥阈值%d，保持压制", b.WindowSeconds, n, b.FailThreshold)
+		}
+		m.updateProbeState(ctx, b.ID, aid, true, msg, probeCompletedAt)
+		if err := m.ensureSuppressedAccount(ctx, b, aid); err != nil && !errors.Is(err, ErrForeignModelRateLimit) {
+			if gateErr != nil {
+				return false, errors.Join(gateErr, err)
+			}
+			return false, err
+		}
+		if gateErr != nil {
+			return false, gateErr
+		}
+		return false, nil
 	}
 
 	canSched, reason := m.ensureSchedulable(ctx, b, aid)
 	if !canSched {
-		if err := m.db.SetAccountState(ctx, b.ID, aid, LaneStateDisabled, &now); err != nil {
-			log.Printf("[laneboard] board=%s account=%d persist external disable: %v", b.Name, aid, err)
-			return false
-		}
-		m.db.LogLaneEvent(ctx, b.Name, b.Model, aid, "disable", "候选探测成功但"+reason)
-		return false
+		m.updateProbeState(ctx, b.ID, aid, true, "探测成功但"+reason, probeCompletedAt)
+		return false, nil
 	}
 
-	cleared, err := m.client.ClearAllOwnedModelRateLimits(ctx, aid, b.Name)
-	if err != nil {
-		log.Printf("[laneboard] board=%s account=%d clear verified suppression: %v", b.Name, aid, err)
-		return false
+	if err := m.db.SetAccountState(ctx, b.ID, aid, LaneStateHealthy, nil); err != nil {
+		return false, err
 	}
-	if cleared == 0 {
-		log.Printf("[laneboard] board=%s account=%d verified release had no owned limit", b.Name, aid)
+	if _, err := m.client.ClearAllOwnedModelRateLimits(ctx, aid, b.Name); err != nil {
+		if rollbackErr := m.restoreBlockedAccount(ctx, b, aid, st); rollbackErr != nil {
+			return false, errors.Join(err, rollbackErr)
+		}
+		return false, err
 	}
 	if err := m.confirmAccountSchedulable(ctx, b, aid); err != nil {
-		if reblockErr := m.ensureSuppressedAccount(ctx, b, aid); reblockErr != nil && !errors.Is(reblockErr, ErrForeignModelRateLimit) {
-			log.Printf("[laneboard] board=%s account=%d reblock after confirmation failure: %v", b.Name, aid, reblockErr)
+		if rollbackErr := m.restoreBlockedAccount(ctx, b, aid, st); rollbackErr != nil {
+			return false, errors.Join(err, rollbackErr)
 		}
-		if stateErr := m.db.SetAccountState(ctx, b.ID, aid, LaneStateDisabled, &now); stateErr != nil {
-			log.Printf("[laneboard] board=%s account=%d persist blocked recovery: %v", b.Name, aid, stateErr)
-		}
-		log.Printf("[laneboard] board=%s account=%d verified release remains blocked: %v", b.Name, aid, err)
-		return false
+		return false, err
 	}
-	if err := m.db.SetAccountState(ctx, b.ID, aid, LaneStateHealthy, nil); err != nil {
-		if reblockErr := m.ensureSuppressedAccount(ctx, b, aid); reblockErr != nil && !errors.Is(reblockErr, ErrForeignModelRateLimit) {
-			log.Printf("[laneboard] board=%s account=%d reblock after state persistence failure: %v", b.Name, aid, reblockErr)
-		}
-		log.Printf("[laneboard] board=%s account=%d persist verified recovery: %v", b.Name, aid, err)
-		return false
-	}
-	if err := m.db.ResetProbeFail(ctx, b.ID, aid, now); err != nil {
+	if err := m.db.ResetProbeFail(ctx, b.ID, aid, probeCompletedAt); err != nil {
 		log.Printf("[laneboard] board=%s account=%d reset probe failures: %v", b.Name, aid, err)
 	}
 	m.db.LogLaneEvent(ctx, b.Name, b.Model, aid, "release", "验证通过，恢复 "+b.Model+" 调度")
 	log.Printf("[laneboard] board=%s account=%d verified and released", b.Name, aid)
-	return true
+	return true, nil
+}
+
+func (m *LaneBoardMonitor) restoreBlockedAccount(ctx context.Context, b *LaneBoard, aid int64, previous AccountState) error {
+	var limitErr error
+	switch previous.State {
+	case LaneStateDisabled:
+		limitErr = m.ensureDisabledAccount(ctx, b, aid)
+	case LaneStateSuppressed:
+		limitErr = m.ensureSuppressedAccount(ctx, b, aid)
+	default:
+		return fmt.Errorf("account %d previous state %q is not blocked", aid, previous.State)
+	}
+	if limitErr != nil && !errors.Is(limitErr, ErrForeignModelRateLimit) {
+		// A model-limit write can fail after a remote recovery has already
+		// cleared the board entry. Fall back to the account-wide switch so a
+		// transient control-plane failure cannot expose the account.
+		if _, fallbackErr := m.client.SetSchedulable(ctx, aid, false); fallbackErr != nil {
+			return errors.Join(limitErr, fmt.Errorf("account-wide fail-closed fallback: %w", fallbackErr))
+		}
+		log.Printf("[laneboard] board=%s account=%d used account-wide fail-closed fallback: %v", b.Name, aid, limitErr)
+	}
+	disabledAt := previous.DisabledAt
+	if disabledAt == nil {
+		now := time.Now()
+		disabledAt = &now
+	}
+	if err := m.db.SetAccountState(ctx, b.ID, aid, previous.State, disabledAt); err != nil {
+		return errors.Join(limitErr, err)
+	}
+	return limitErr
 }
 
 func (m *LaneBoardMonitor) disableAccount(ctx context.Context, b *LaneBoard, aid int64, st AccountState) error {
@@ -1220,6 +1435,21 @@ func (m *LaneBoardMonitor) disableAccount(ctx context.Context, b *LaneBoard, aid
 	}
 	m.db.LogLaneEvent(ctx, b.Name, b.Model, aid, "disable", fmt.Sprintf("%ds内%d次失败≥阈值%d，关闭%s调度", b.WindowSeconds, st.FailCount, b.FailThreshold, b.Model))
 	log.Printf("[laneboard] board=%s account=%d disabled (%d fails/%ds)", b.Name, aid, st.FailCount, b.WindowSeconds)
+	return nil
+}
+
+func (m *LaneBoardMonitor) confirmExternalSchedulable(ctx context.Context, b *LaneBoard, aid int64) error {
+	blocks, err := m.db.GetExternalBlocks(ctx, []int64{aid}, b.Model, b.Name)
+	if err != nil {
+		return err
+	}
+	block, ok := blocks[aid]
+	if !ok {
+		return fmt.Errorf("account %d was not found", aid)
+	}
+	if block.blocked(time.Now()) {
+		return fmt.Errorf("account remains externally blocked: %s", block.blockedReason(time.Now()))
+	}
 	return nil
 }
 
@@ -1241,19 +1471,22 @@ func (m *LaneBoardMonitor) confirmAccountSchedulable(ctx context.Context, b *Lan
 	return nil
 }
 
-func (m *LaneBoardMonitor) enableAccount(ctx context.Context, b *LaneBoard, aid int64) error {
-	if _, err := m.client.ClearAllOwnedModelRateLimits(ctx, aid, b.Name); err != nil {
-		return err
-	}
-	if err := m.confirmAccountSchedulable(ctx, b, aid); err != nil {
-		if reblockErr := m.ensureDisabledAccount(ctx, b, aid); reblockErr != nil && !errors.Is(reblockErr, ErrForeignModelRateLimit) {
-			log.Printf("[laneboard] board=%s account=%d reblock after enable confirmation failure: %v", b.Name, aid, reblockErr)
-		}
+func (m *LaneBoardMonitor) enableAccount(ctx context.Context, b *LaneBoard, aid int64, previous AccountState) error {
+	if err := m.confirmExternalSchedulable(ctx, b, aid); err != nil {
 		return err
 	}
 	if err := m.db.SetAccountState(ctx, b.ID, aid, LaneStateHealthy, nil); err != nil {
-		if reblockErr := m.ensureDisabledAccount(ctx, b, aid); reblockErr != nil && !errors.Is(reblockErr, ErrForeignModelRateLimit) {
-			log.Printf("[laneboard] board=%s account=%d reblock after enable state failure: %v", b.Name, aid, reblockErr)
+		return err
+	}
+	if _, err := m.client.ClearAllOwnedModelRateLimits(ctx, aid, b.Name); err != nil {
+		if rollbackErr := m.restoreBlockedAccount(ctx, b, aid, previous); rollbackErr != nil {
+			return errors.Join(err, rollbackErr)
+		}
+		return err
+	}
+	if err := m.confirmAccountSchedulable(ctx, b, aid); err != nil {
+		if rollbackErr := m.restoreBlockedAccount(ctx, b, aid, previous); rollbackErr != nil {
+			return errors.Join(err, rollbackErr)
 		}
 		return err
 	}
@@ -1265,7 +1498,9 @@ func (m *LaneBoardMonitor) enableAccount(ctx context.Context, b *LaneBoard, aid 
 // ManualProbe serializes with monitor cycles and validates board ownership.
 func (m *LaneBoardMonitor) ManualProbe(ctx context.Context, boardID, accountID int64) (bool, string, error) {
 	lock := m.lockForBoard(boardID)
-	lock.Lock()
+	if !lockWithContext(ctx, lock) {
+		return false, "", ctx.Err()
+	}
 	defer lock.Unlock()
 
 	b, err := m.db.GetBoard(ctx, boardID)
@@ -1275,16 +1510,19 @@ func (m *LaneBoardMonitor) ManualProbe(ctx context.Context, boardID, accountID i
 	if !b.Enabled {
 		return false, "", fmt.Errorf("%w: board %q is disabled", ErrInvalidBoard, b.Name)
 	}
-	belongs := false
-	for _, id := range boardAccountIDs(b) {
-		if id == accountID {
-			belongs = true
-			break
-		}
-	}
+	targetLane, belongs := boardAccountLaneIndex(b, accountID)
 	if !belongs {
 		return false, "", fmt.Errorf("%w: account %d does not belong to board %q", ErrInvalidBoard, accountID, b.Name)
 	}
+	states, err := m.db.GetAccountStates(ctx, b.ID)
+	if err != nil {
+		return false, "", err
+	}
+	targetState, exists := states[accountID]
+	if !exists || !validLaneAccountState(targetState.State) {
+		return false, "", fmt.Errorf("account %d has no valid local state", accountID)
+	}
+	activeIdx := boardActiveLaneIndex(b, states)
 
 	now := time.Now()
 	blocks, err := m.db.GetExternalBlocks(ctx, []int64{accountID}, b.Model, b.Name)
@@ -1301,30 +1539,68 @@ func (m *LaneBoardMonitor) ManualProbe(ctx context.Context, boardID, accountID i
 	}
 	if !gatePass {
 		msg := fmt.Sprintf("%d秒窗口内%d次失败≥阈值%d，CheckErrors未通过不探测", b.WindowSeconds, n, b.FailThreshold)
-		m.updateProbeState(ctx, boardID, accountID, false, msg, now)
+		m.updateProbeDecision(ctx, boardID, accountID, msg, now)
 		return false, msg, nil
 	}
 
 	ok, msg, err := m.client.TestAccountModel(ctx, accountID, b.Model)
+	probeCompletedAt := time.Now()
 	if err != nil {
 		msg = err.Error()
 		ok = false
 	}
-	if updateErr := m.db.UpdateAccountStateProbe(ctx, boardID, accountID, ok, msg, now); updateErr != nil {
+	if updateErr := m.db.UpdateAccountStateProbe(ctx, boardID, accountID, ok, msg, probeCompletedAt); updateErr != nil {
 		return false, msg, updateErr
 	}
 	if !ok {
 		return false, msg, err
 	}
+
+	gatePass, n, err = m.checkErrorsGate(ctx, b, accountID)
+	if err != nil || !gatePass {
+		if err != nil {
+			msg = "探测成功但恢复前 CheckErrors 复查失败: " + err.Error()
+		} else {
+			msg = fmt.Sprintf("探测成功但%d秒窗口内%d次失败≥阈值%d，保持原状态", b.WindowSeconds, n, b.FailThreshold)
+		}
+		m.updateProbeState(ctx, boardID, accountID, true, msg, probeCompletedAt)
+		return false, msg, err
+	}
+
+	if activeIdx >= 0 && targetLane > activeIdx {
+		switch targetState.State {
+		case LaneStateSuppressed:
+			err = m.ensureSuppressedAccount(ctx, b, accountID)
+		case LaneStateHealthy:
+			err = m.ensureSuppressedAccount(ctx, b, accountID)
+			if err == nil {
+				err = m.db.SetAccountState(ctx, b.ID, accountID, LaneStateSuppressed, nil)
+			}
+		default:
+			err = m.ensureDisabledAccount(ctx, b, accountID)
+		}
+		if err != nil {
+			return false, "探测成功但保持低优先级阻断失败: " + err.Error(), err
+		}
+		msg = "探测成功，但更高优先级泳道仍在运行，保持当前泳道压制"
+		m.updateProbeState(ctx, boardID, accountID, true, msg, probeCompletedAt)
+		return false, msg, nil
+	}
+
 	canSched, reason := m.ensureSchedulable(ctx, b, accountID)
 	if !canSched {
 		return false, "探测成功但" + reason, nil
 	}
-	if err := m.enableAccount(ctx, b, accountID); err != nil {
+	if err := m.enableAccount(ctx, b, accountID, targetState); err != nil {
 		return false, "探测成功但恢复调度失败: " + err.Error(), err
 	}
 	if _, err := m.reconcileBoard(ctx, b); err != nil {
-		return false, "探测成功但泳道重排失败: " + err.Error(), err
+		if targetState.State == LaneStateDisabled || targetState.State == LaneStateSuppressed {
+			if rollbackErr := m.restoreBlockedAccount(ctx, b, accountID, targetState); rollbackErr != nil {
+				return false, "探测成功但泳道重排和恢复回滚均失败: " + errors.Join(err, rollbackErr).Error(), errors.Join(err, rollbackErr)
+			}
+		}
+		return false, "探测成功但泳道重排失败，已恢复原阻断状态: " + err.Error(), err
 	}
 	return true, msg, nil
 }

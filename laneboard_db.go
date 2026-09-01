@@ -95,6 +95,15 @@ WHERE board_id=$1 AND account_id=$2`, boardID, accountID, at, ok, msg)
 	return err
 }
 
+// UpdateAccountStateDecision records a skipped-probe reason without consuming
+// the configured probe interval. Only a real /test attempt advances last_probe_at.
+func (d *DB) UpdateAccountStateDecision(ctx context.Context, boardID, accountID int64, msg string, checkedAt time.Time) error {
+	_, err := d.pool.Exec(ctx, `
+UPDATE lane_account_states SET last_probe_msg=$3, checked_at=$4
+WHERE board_id=$1 AND account_id=$2`, boardID, accountID, msg, checkedAt)
+	return err
+}
+
 // ============================ 事件记录 ============================
 
 // LogLaneEvent 泳道图事件写入 switch_history（复用现有历史表）
